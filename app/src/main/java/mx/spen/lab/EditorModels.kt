@@ -9,6 +9,7 @@ enum class ToolMode(val label: String) {
     LASSO("Lazo")
 }
 
+/** Stable on-disk brush codes. Never renumber existing codes (1=PEN, 2=PENCIL, 3=HIGHLIGHTER). */
 enum class BrushType(val code: Int) {
     PEN(1),
     PENCIL(2),

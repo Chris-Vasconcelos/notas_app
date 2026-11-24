@@ -87,6 +87,9 @@ class PenSheet(
                 debugRaw = null
             )
         }
+
+        override fun equals(other: Any?): Boolean = (other is InkItem) && other.id == id
+        override fun hashCode(): Int = id.hashCode()
     }
 
     data class ShapeItem(
@@ -108,8 +111,13 @@ class PenSheet(
                 isHighlighter = isHighlighter
             )
         }
+
+        override fun equals(other: Any?): Boolean = (other is ShapeItem) && other.id == id
+        override fun hashCode(): Int = id.hashCode()
     }
 
+    private val isDebugBuild =
+        (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
     private val density = resources.displayMetrics.density
     private val renderInk = CanvasStrokeRenderer.create()
     private val wetInk = InProgressStrokesView(context)
@@ -243,7 +251,16 @@ class PenSheet(
     /** Debug mode for Step A exit test: draws raw screen-space stroke in red and normalized world stroke in semi-transparent blue. */
     var debugCompareNormalized: Boolean = false
         set(value) {
-            field = value
+            val enabled = isDebugBuild && value
+            field = enabled
+            if (!enabled) {
+                for (i in items.indices) {
+                    val it = items[i]
+                    if (it is InkItem && it.debugRaw != null) {
+                        items[i] = it.copy(debugRaw = null)
+                    }
+                }
+            }
             dryInk.invalidate()
         }
 
@@ -587,13 +604,17 @@ class PenSheet(
                     } else {
                         val (strokeData, worldStroke) = normalizeAndRebuildStroke(rawStroke, meta)
                         val bounds = computeStrokeWorldBounds(worldStroke, strokeData)
-                        val redBrush = rawStroke.brush.copyWithColorIntArgb(0xFFFF1744.toInt())
-                        val debugRaw = DebugRawStroke(
-                            redStroke = rawStroke.copy(redBrush),
-                            creationScale = meta.scale,
-                            creationPanX = meta.panX,
-                            creationPanY = meta.panY
-                        )
+                        val debugRaw = if (isDebugBuild && debugCompareNormalized) {
+                            val redBrush = rawStroke.brush.copyWithColorIntArgb(0xFFFF1744.toInt())
+                            DebugRawStroke(
+                                redStroke = rawStroke.copy(redBrush),
+                                creationScale = meta.scale,
+                                creationPanX = meta.panX,
+                                creationPanY = meta.panY
+                            )
+                        } else {
+                            null
+                        }
                         items.add(
                             InkItem(
                                 id = allocateId(),
@@ -1278,7 +1299,9 @@ internal fun buildStrokeFromData(data: StrokeData): Stroke {
     val batch = MutableStrokeInputBatch()
     batch.setNoiseSeed(data.noiseSeed)
     val toolType = toolTypeFromCode(data.toolTypeInt)
-    for (pt in data.points) {
+    var rejectedPoints = 0
+    for (i in data.points.indices) {
+        val pt = data.points[i]
         runCatching {
             batch.add(
                 toolType,
@@ -1290,7 +1313,16 @@ internal fun buildStrokeFromData(data: StrokeData): Stroke {
                 pt.tiltRadians,
                 pt.orientationRadians
             )
+        }.onFailure { err ->
+            rejectedPoints++
+            Log.w("PenSheet", "buildStrokeFromData: rejected point[$i] (t=${pt.elapsedTimeMillis}ms): ${err.message}")
         }
+    }
+    if (rejectedPoints > 0 || batch.size != data.points.size) {
+        Log.w(
+            "PenSheet",
+            "buildStrokeFromData: batch.size=${batch.size} vs expected=${data.points.size} (rejected=$rejectedPoints)"
+        )
     }
     return Stroke(brush, batch)
 }
