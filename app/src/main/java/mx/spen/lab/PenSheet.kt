@@ -1239,8 +1239,8 @@ class PenSheet(
             sizeWorld = sizeWorld,
             epsilonWorld = epsilonWorld,
             isHighlighter = meta.isHighlighter,
-            toolTypeInt = inputs.toolType.toCode(),
-            noiseSeed = inputs.noiseSeed,
+            toolTypeInt = inputs.getToolType().toCode(),
+            noiseSeed = inputs.getNoiseSeed(),
             points = pts
         )
         val worldStroke = buildStrokeFromData(data)
