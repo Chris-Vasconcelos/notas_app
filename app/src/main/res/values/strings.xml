@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">S Pen Lab</string>
+    <string name="app_name_preview">S Pen Lab Beta</string>
+    <string name="action_undo">Deshacer último cambio</string>
+    <string name="action_color">Cambiar color del bolígrafo</string>
+</resources>
