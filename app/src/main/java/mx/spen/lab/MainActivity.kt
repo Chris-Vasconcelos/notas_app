@@ -97,6 +97,7 @@ class MainActivity : ComponentActivity() {
 
     // Diagnostics & Air Actions
     private var showHudOverlay by mutableStateOf(false)
+    private var debugCompareNormalized by mutableStateOf(false)
     private var telemetry by mutableStateOf(PenTelemetry())
     private var remoteCount by mutableIntStateOf(0)
     private var remoteStatus by mutableStateOf("En espera de acciones")
@@ -129,7 +130,7 @@ class MainActivity : ComponentActivity() {
                         zoomPercent = telemetry.zoomPercent,
                         canUndo = canUndo,
                         canRedo = canRedo,
-                        onResetZoom = { sheet?.resetZoom() },
+                        onFitContent = { sheet?.fitToContent() },
                         onUndo = { sheet?.undo() },
                         onRedo = { sheet?.redo() },
                         onOpenPaper = { showPaperDialog = true },
@@ -288,11 +289,16 @@ class MainActivity : ComponentActivity() {
                     DiagnosticsDialog(
                         telemetry = telemetry,
                         showHud = showHudOverlay,
+                        debugCompareNormalized = debugCompareNormalized,
                         remoteCount = remoteCount,
                         remoteStatus = remoteStatus,
                         onToggleHud = { enabled ->
                             showHudOverlay = enabled
                             sheet?.showDiagnostics = enabled
+                        },
+                        onToggleCompareNormalized = { enabled ->
+                            debugCompareNormalized = enabled
+                            sheet?.debugCompareNormalized = enabled
                         },
                         onOpenHelp = {
                             showDiagnosticsDialog = false
@@ -355,6 +361,7 @@ class MainActivity : ComponentActivity() {
         view.paperStyle = paperStyle
         view.paperTemplate = paperTemplate
         view.showDiagnostics = showHudOverlay
+        view.debugCompareNormalized = debugCompareNormalized
     }
 
     private fun currentIndicatorColor(): Color = when (activeTool) {
@@ -425,7 +432,7 @@ private fun TopEditorBar(
     zoomPercent: Int,
     canUndo: Boolean,
     canRedo: Boolean,
-    onResetZoom: () -> Unit,
+    onFitContent: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
     onOpenPaper: () -> Unit,
@@ -448,20 +455,18 @@ private fun TopEditorBar(
                 fontWeight = FontWeight.SemiBold,
                 color = InkTextPrimary
             )
-            if (zoomPercent != 100) {
-                Spacer(Modifier.width(8.dp))
-                Surface(
-                    color = PetroleumDeep,
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.clickable(onClick = onResetZoom)
-                ) {
-                    Text(
-                        text = "$zoomPercent%",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = InkTextPrimary,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                    )
-                }
+            Spacer(Modifier.width(8.dp))
+            Surface(
+                color = PetroleumDeep,
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.clickable(onClick = onFitContent)
+            ) {
+                Text(
+                    text = "$zoomPercent% · Encajar",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = InkTextPrimary,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                )
             }
             Spacer(Modifier.weight(1f))
             TextButton(onClick = onUndo, enabled = canUndo) {
@@ -742,9 +747,11 @@ private fun PaperSettingsDialog(
 private fun DiagnosticsDialog(
     telemetry: PenTelemetry,
     showHud: Boolean,
+    debugCompareNormalized: Boolean,
     remoteCount: Int,
     remoteStatus: String,
     onToggleHud: (Boolean) -> Unit,
+    onToggleCompareNormalized: (Boolean) -> Unit,
     onOpenHelp: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -763,6 +770,18 @@ private fun DiagnosticsDialog(
                     Switch(
                         checked = showHud,
                         onCheckedChange = onToggleHud,
+                        colors = SwitchDefaults.colors(checkedThumbColor = Petroleum)
+                    )
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Paso A: Superponer trazo original (rojo) vs normalizado (azul)",
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = debugCompareNormalized,
+                        onCheckedChange = onToggleCompareNormalized,
                         colors = SwitchDefaults.colors(checkedThumbColor = Petroleum)
                     )
                 }

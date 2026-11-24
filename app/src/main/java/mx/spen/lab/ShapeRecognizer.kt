@@ -1,6 +1,7 @@
 package mx.spen.lab
 
 import android.graphics.PointF
+import android.graphics.RectF
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.atan2
@@ -13,10 +14,24 @@ import kotlin.math.sqrt
 
 sealed class RecognizedShape(val label: String) {
     abstract fun samplePoints(stepPx: Float = 8f): List<PointF>
+    abstract fun translated(dx: Float, dy: Float): RecognizedShape
+    abstract fun computeWorldBounds(strokeWidthWorld: Float): RectF
 
     class Line(val start: PointF, val end: PointF) : RecognizedShape("Línea") {
         override fun samplePoints(stepPx: Float): List<PointF> =
             sampleSegment(start, end, stepPx)
+
+        override fun translated(dx: Float, dy: Float): Line =
+            Line(PointF(start.x + dx, start.y + dy), PointF(end.x + dx, end.y + dy))
+
+        override fun computeWorldBounds(strokeWidthWorld: Float): RectF =
+            inflatedBounds(
+                min(start.x, end.x),
+                min(start.y, end.y),
+                max(start.x, end.x),
+                max(start.y, end.y),
+                strokeWidthWorld
+            )
     }
 
     class Arrow(
@@ -32,6 +47,21 @@ sealed class RecognizedShape(val label: String) {
             pts += sampleSegment(wingLeft, end, stepPx)
             pts += sampleSegment(end, wingRight, stepPx)
             return pts
+        }
+
+        override fun translated(dx: Float, dy: Float): Arrow = Arrow(
+            start = PointF(start.x + dx, start.y + dy),
+            end = PointF(end.x + dx, end.y + dy),
+            wingLeft = PointF(wingLeft.x + dx, wingLeft.y + dy),
+            wingRight = PointF(wingRight.x + dx, wingRight.y + dy)
+        )
+
+        override fun computeWorldBounds(strokeWidthWorld: Float): RectF {
+            val minX = minOf(start.x, end.x, wingLeft.x, wingRight.x)
+            val minY = minOf(start.y, end.y, wingLeft.y, wingRight.y)
+            val maxX = maxOf(start.x, end.x, wingLeft.x, wingRight.x)
+            val maxY = maxOf(start.y, end.y, wingLeft.y, wingRight.y)
+            return inflatedBounds(minX, minY, maxX, maxY, strokeWidthWorld)
         }
     }
 
@@ -54,6 +84,17 @@ sealed class RecognizedShape(val label: String) {
             pts += sampleSegment(bl, tl, stepPx).drop(1)
             return pts
         }
+
+        override fun translated(dx: Float, dy: Float): Rectangle = Rectangle(
+            left = left + dx,
+            top = top + dy,
+            right = right + dx,
+            bottom = bottom + dy,
+            isSquare = isSquare
+        )
+
+        override fun computeWorldBounds(strokeWidthWorld: Float): RectF =
+            inflatedBounds(min(left, right), min(top, bottom), max(left, right), max(top, bottom), strokeWidthWorld)
     }
 
     class Triangle(
@@ -67,6 +108,20 @@ sealed class RecognizedShape(val label: String) {
             pts += sampleSegment(b, c, stepPx).drop(1)
             pts += sampleSegment(c, a, stepPx).drop(1)
             return pts
+        }
+
+        override fun translated(dx: Float, dy: Float): Triangle = Triangle(
+            a = PointF(a.x + dx, a.y + dy),
+            b = PointF(b.x + dx, b.y + dy),
+            c = PointF(c.x + dx, c.y + dy)
+        )
+
+        override fun computeWorldBounds(strokeWidthWorld: Float): RectF {
+            val minX = minOf(a.x, b.x, c.x)
+            val minY = minOf(a.y, b.y, c.y)
+            val maxX = maxOf(a.x, b.x, c.x)
+            val maxY = maxOf(a.y, b.y, c.y)
+            return inflatedBounds(minX, minY, maxX, maxY, strokeWidthWorld)
         }
     }
 
@@ -92,6 +147,28 @@ sealed class RecognizedShape(val label: String) {
             }
             return pts
         }
+
+        override fun translated(dx: Float, dy: Float): Ellipse = Ellipse(
+            cx = cx + dx,
+            cy = cy + dy,
+            rx = rx,
+            ry = ry,
+            isCircle = isCircle
+        )
+
+        override fun computeWorldBounds(strokeWidthWorld: Float): RectF =
+            inflatedBounds(cx - rx, cy - ry, cx + rx, cy + ry, strokeWidthWorld)
+    }
+
+    protected fun inflatedBounds(
+        minX: Float,
+        minY: Float,
+        maxX: Float,
+        maxY: Float,
+        strokeWidthWorld: Float
+    ): RectF {
+        val pad = strokeWidthWorld * 0.5f + 2f
+        return RectF(minX - pad, minY - pad, maxX + pad, maxY + pad)
     }
 }
 
@@ -150,7 +227,6 @@ object ShapeRecognizer {
         // 2. Closed shapes (circle, ellipse, rectangle, triangle)
         val isClosed = endGap <= max(28f * density, diag * 0.28f) && pathLen > diag * 1.8f
         if (isClosed) {
-            // Check Circle / Ellipse via radial uniformity around bounding center
             val cx = (minX + maxX) * 0.5f
             val cy = (minY + maxY) * 0.5f
             val rx = boxW * 0.5f
@@ -176,7 +252,6 @@ object ShapeRecognizer {
                 }
             }
 
-            // Simplify polygon with Ramer-Douglas-Peucker to count corners
             val closedPts = rawPoints + first
             val simplified = rdp(closedPts, max(10f * density, diag * 0.06f))
             val corners = removeDuplicateClosingPoint(simplified, 16f * density)
@@ -185,7 +260,6 @@ object ShapeRecognizer {
                 return RecognizedShape.Triangle(corners[0], corners[1], corners[2])
             }
             if (corners.size == 4) {
-                // Check if close to axis-aligned rectangle
                 val aspect = min(boxW, boxH) / max(boxW, boxH)
                 val isSquare = aspect >= 0.86f
                 val finalW = if (isSquare) (boxW + boxH) * 0.5f else boxW
@@ -201,7 +275,6 @@ object ShapeRecognizer {
                 )
             }
 
-            // Fallback: if 4-sided bounding box fit is strong
             val boxPerimeter = 2f * (boxW + boxH)
             if (abs(pathLen - boxPerimeter) / boxPerimeter < 0.22f) {
                 var edgeDistSum = 0f
@@ -228,7 +301,7 @@ object ShapeRecognizer {
             if (shaftLen > minSize && tailLen in (10f * density)..(shaftLen * 0.55f)) {
                 val shaftAngle = atan2(tip.y - shaftStart.y, tip.x - shaftStart.x)
                 val headLen = max(14f * density, min(26f * density, shaftLen * 0.22f))
-                val wingAngle = 0.52f // ~30 degrees
+                val wingAngle = 0.52f
                 val leftWing = PointF(
                     tip.x - headLen * cos(shaftAngle - wingAngle),
                     tip.y - headLen * sin(shaftAngle - wingAngle)
@@ -249,7 +322,6 @@ object ShapeRecognizer {
         val dy = b.y - a.y
         val angleDeg = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble()))
         val len = hypot(dx, dy)
-        // Snap within 6 degrees to horizontal, vertical, or 45-degree diagonals
         val snapAngles = doubleArrayOf(0.0, 45.0, 90.0, 135.0, 180.0, -45.0, -90.0, -135.0, -180.0)
         for (target in snapAngles) {
             if (abs(angleDeg - target) <= 6.0) {

@@ -11,6 +11,7 @@ import android.graphics.PointF
 import android.graphics.RectF
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.util.TypedValue
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
@@ -20,13 +21,17 @@ import androidx.ink.authoring.InProgressStrokeId
 import androidx.ink.authoring.InProgressStrokesFinishedListener
 import androidx.ink.authoring.InProgressStrokesView
 import androidx.ink.brush.Brush
+import androidx.ink.brush.BrushFamily
+import androidx.ink.brush.InputToolType
 import androidx.ink.brush.StockBrushes
 import androidx.ink.geometry.AffineTransform
 import androidx.ink.geometry.ImmutableBox
 import androidx.ink.geometry.ImmutableVec
 import androidx.ink.geometry.Intersection.intersects
 import androidx.ink.rendering.android.canvas.CanvasStrokeRenderer
+import androidx.ink.strokes.MutableStrokeInputBatch
 import androidx.ink.strokes.Stroke
+import androidx.ink.strokes.StrokeInput
 import androidx.input.motionprediction.MotionEventPredictor
 import java.util.Locale
 import kotlin.math.abs
@@ -36,98 +41,99 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
-/** Keeps high-frequency stylus input, zoom/pan, shapes, lasso, and ink layers outside Compose state. */
+/** Keeps high-frequency stylus input, world-normalized strokes, zoom/pan, shapes, and lasso outside Compose state. */
 class PenSheet(
     context: Context,
     private val onStateChanged: (canUndo: Boolean, canRedo: Boolean, hasSelection: Boolean) -> Unit,
     private val onTelemetryChanged: (PenTelemetry) -> Unit = {}
 ) : FrameLayout(context) {
 
-    sealed class CanvasItem {
-        abstract val isHighlighter: Boolean
-        abstract val offsetX: Float
-        abstract val offsetY: Float
-        abstract fun translated(dx: Float, dy: Float): CanvasItem
-        abstract fun recolored(newColor: Int): CanvasItem?
-        abstract fun worldBounds(): RectF
+    companion object {
+        private const val TAG = "PenSheet"
     }
 
-    data class InkItem(
-        val stroke: Stroke,
+    sealed interface CanvasItem {
+        val id: Long
+        val worldBounds: RectF
+        val isHighlighter: Boolean
+        fun translated(dx: Float, dy: Float, newId: Long = id): CanvasItem
+    }
+
+    data class DebugRawStroke(
+        val redStroke: Stroke,
         val creationScale: Float,
         val creationPanX: Float,
-        val creationPanY: Float,
+        val creationPanY: Float
+    )
+
+    data class InkItem(
+        override val id: Long,
+        val data: StrokeData,
+        val stroke: Stroke,
+        override val worldBounds: RectF,
         override val isHighlighter: Boolean,
-        override val offsetX: Float = 0f,
-        override val offsetY: Float = 0f
-    ) : CanvasItem() {
-        override fun translated(dx: Float, dy: Float): InkItem =
-            copy(offsetX = offsetX + dx, offsetY = offsetY + dy)
-
-        override fun recolored(newColor: Int): InkItem? = null
-
-        override fun worldBounds(): RectF {
-            val box = stroke.shape.computeBoundingBox() ?: return RectF()
-            val left = (box.xMin - creationPanX) / creationScale + offsetX
-            val top = (box.yMin - creationPanY) / creationScale + offsetY
-            val right = (box.xMax - creationPanX) / creationScale + offsetX
-            val bottom = (box.yMax - creationPanY) / creationScale + offsetY
-            return RectF(left, top, right, bottom)
+        val debugRaw: DebugRawStroke? = null
+    ) : CanvasItem {
+        override fun translated(dx: Float, dy: Float, newId: Long): InkItem {
+            val movedData = data.translated(dx, dy)
+            val movedStroke = buildStrokeFromData(movedData)
+            val movedBounds = computeStrokeWorldBounds(movedStroke, movedData)
+            return InkItem(
+                id = newId,
+                data = movedData,
+                stroke = movedStroke,
+                worldBounds = movedBounds,
+                isHighlighter = isHighlighter,
+                debugRaw = null
+            )
         }
     }
 
     data class ShapeItem(
+        override val id: Long,
         val shape: RecognizedShape,
         val color: Int,
         val strokeWidthWorld: Float,
-        override val isHighlighter: Boolean,
-        override val offsetX: Float = 0f,
-        override val offsetY: Float = 0f
-    ) : CanvasItem() {
-        override fun translated(dx: Float, dy: Float): ShapeItem =
-            copy(offsetX = offsetX + dx, offsetY = offsetY + dy)
-
-        override fun recolored(newColor: Int): ShapeItem = copy(color = newColor)
-
-        override fun worldBounds(): RectF {
-            val pts = shape.samplePoints(12f)
-            if (pts.isEmpty()) return RectF()
-            var minX = Float.POSITIVE_INFINITY
-            var maxX = Float.NEGATIVE_INFINITY
-            var minY = Float.POSITIVE_INFINITY
-            var maxY = Float.NEGATIVE_INFINITY
-            for (p in pts) {
-                val wx = p.x + offsetX
-                val wy = p.y + offsetY
-                if (wx < minX) minX = wx
-                if (wx > maxX) maxX = wx
-                if (wy < minY) minY = wy
-                if (wy > maxY) maxY = wy
-            }
-            val pad = strokeWidthWorld * 0.5f
-            return RectF(minX - pad, minY - pad, maxX + pad, maxY + pad)
+        override val worldBounds: RectF,
+        override val isHighlighter: Boolean
+    ) : CanvasItem {
+        override fun translated(dx: Float, dy: Float, newId: Long): ShapeItem {
+            val movedShape = shape.translated(dx, dy)
+            return ShapeItem(
+                id = newId,
+                shape = movedShape,
+                color = color,
+                strokeWidthWorld = strokeWidthWorld,
+                worldBounds = movedShape.computeWorldBounds(strokeWidthWorld),
+                isHighlighter = isHighlighter
+            )
         }
     }
 
     private val density = resources.displayMetrics.density
     private val renderInk = CanvasStrokeRenderer.create()
     private val wetInk = InProgressStrokesView(context)
-    private val penFamily = StockBrushes.pressurePen()
+
+    private var nextItemId = 1L
+    private fun allocateId(): Long = nextItemId++
 
     private val items = mutableListOf<CanvasItem>()
     private val undoHistory = ArrayDeque<List<CanvasItem>>()
     private val redoHistory = ArrayDeque<List<CanvasItem>>()
-    private val erased = mutableSetOf<CanvasItem>()
+    private val erasedIds = mutableSetOf<Long>()
+    private val selectedIds = mutableSetOf<Long>()
     private val waitingForInk = mutableMapOf<InProgressStrokeId, PendingStrokeMeta>()
 
     private data class PendingStrokeMeta(
         val scale: Float,
         val panX: Float,
         val panY: Float,
-        val isHighlighter: Boolean,
+        val brushType: BrushType,
         val color: Int,
-        val strokeWidthWorld: Float,
-        val snappedShape: RecognizedShape?
+        val sizeWorld: Float,
+        val epsilonWorld: Float,
+        val isHighlighter: Boolean,
+        val snappedShape: RecognizedShape? = null
     )
 
     // Active stylus state
@@ -181,17 +187,18 @@ class PenSheet(
         }
     )
 
-    // Lasso selection state
+    // Lasso selection & temporary drag state (baked on finishPen)
     private val lassoPathWorld = mutableListOf<PointF>()
-    private val selectedItems = mutableSetOf<CanvasItem>()
     private var selectionDragLastWorld: PointF? = null
     private var isDraggingSelection = false
+    private var dragDx = 0f
+    private var dragDy = 0f
 
     // Configurable editor properties
     var toolMode: ToolMode = ToolMode.PEN
         set(value) {
             field = value
-            if (value != ToolMode.LASSO && selectedItems.isNotEmpty()) {
+            if (value != ToolMode.LASSO && selectedIds.isNotEmpty()) {
                 clearSelection()
             }
             diagnostics.invalidate()
@@ -233,6 +240,13 @@ class PenSheet(
             diagnostics.invalidate()
         }
 
+    /** Debug mode for Step A exit test: draws raw screen-space stroke in red and normalized world stroke in semi-transparent blue. */
+    var debugCompareNormalized: Boolean = false
+        set(value) {
+            field = value
+            dryInk.invalidate()
+        }
+
     private val diagnosticTextSize = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_SP, 12f, resources.displayMetrics
     )
@@ -254,6 +268,9 @@ class PenSheet(
     private fun screenToWorldY(sy: Float): Float = (sy - panY) / viewScale
 
     private val dryInk = object : View(context) {
+        private val visibleWorldRect = RectF()
+        private val itemCheckRect = RectF()
+
         override fun onDraw(canvas: Canvas) {
             canvas.drawColor(paperStyle.bgColor)
 
@@ -261,17 +278,24 @@ class PenSheet(
             canvas.translate(panX, panY)
             canvas.scale(viewScale, viewScale)
 
+            visibleWorldRect.set(
+                -panX / viewScale,
+                -panY / viewScale,
+                (width - panX) / viewScale,
+                (height - panY) / viewScale
+            )
+
             drawPaperTemplate(canvas)
 
             // Pass 1: Highlighter strokes & shapes behind opaque ink
             for (item in items) {
-                if (item !in erased && item.isHighlighter) {
+                if (item.id !in erasedIds && item.isHighlighter && isItemVisible(item, visibleWorldRect, itemCheckRect)) {
                     drawCanvasItem(canvas, item)
                 }
             }
             // Pass 2: Opaque pen strokes & geometric shapes
             for (item in items) {
-                if (item !in erased && !item.isHighlighter) {
+                if (item.id !in erasedIds && !item.isHighlighter && isItemVisible(item, visibleWorldRect, itemCheckRect)) {
                     drawCanvasItem(canvas, item)
                 }
             }
@@ -289,8 +313,8 @@ class PenSheet(
                 canvas.drawPath(path, lassoPaint)
             }
 
-            // Selection bounding box
-            if (selectedItems.isNotEmpty()) {
+            // Selection bounding box (includes temporary dragDx/dragDy while dragging)
+            if (selectedIds.isNotEmpty()) {
                 val bounds = computeSelectionBounds()
                 if (!bounds.isEmpty) {
                     val pad = 8f * density / viewScale
@@ -305,11 +329,19 @@ class PenSheet(
             holdSnappedShape?.let { preview ->
                 shapePaint.color = Color.argb(180, 42, 161, 183)
                 shapePaint.strokeWidth = (penWidthDp * density) / viewScale
-                drawShape(canvas, preview, 0f, 0f)
+                drawShape(canvas, preview)
             }
 
             canvas.restore()
         }
+    }
+
+    private fun isItemVisible(item: CanvasItem, visibleWorld: RectF, scratch: RectF): Boolean {
+        scratch.set(item.worldBounds)
+        if (isDraggingSelection && item.id in selectedIds) {
+            scratch.offset(dragDx, dragDy)
+        }
+        return RectF.intersects(visibleWorld, scratch)
     }
 
     private fun drawPaperTemplate(canvas: Canvas) {
@@ -371,7 +403,6 @@ class PenSheet(
                 val span = max(worldRight - worldLeft, worldBottom - worldTop) + step * 4
                 val baseX = (kotlin.math.floor((worldLeft / dx).toDouble()) * dx).toFloat() - span
                 val baseY = (kotlin.math.floor((worldTop / dy).toDouble()) * dy).toFloat()
-                // Horizontal-ish and 60-degree diagonals
                 var gy = baseY
                 while (gy <= worldBottom) {
                     canvas.drawLine(worldLeft, gy, worldRight, gy, paint)
@@ -390,71 +421,90 @@ class PenSheet(
     }
 
     private fun drawCanvasItem(canvas: Canvas, item: CanvasItem) {
+        val applyTempDrag = isDraggingSelection && item.id in selectedIds
+        if (applyTempDrag) {
+            canvas.save()
+            canvas.translate(dragDx, dragDy)
+        }
+
         when (item) {
             is InkItem -> {
-                canvas.save()
-                canvas.translate(item.offsetX, item.offsetY)
-                canvas.scale(1f / item.creationScale, 1f / item.creationScale)
-                canvas.translate(-item.creationPanX, -item.creationPanY)
-                renderInk.draw(canvas, item.stroke, AffineTransform.IDENTITY)
-                canvas.restore()
+                if (debugCompareNormalized && item.debugRaw != null) {
+                    val raw = item.debugRaw
+                    canvas.save()
+                    canvas.scale(1f / raw.creationScale, 1f / raw.creationScale)
+                    canvas.translate(-raw.creationPanX, -raw.creationPanY)
+                    renderInk.draw(canvas, raw.redStroke, AffineTransform.IDENTITY)
+                    canvas.restore()
+
+                    val blueStroke = item.stroke.copy(
+                        item.stroke.brush.copyWithColorIntArgb(0x9900B0FF.toInt())
+                    )
+                    renderInk.draw(canvas, blueStroke, AffineTransform.IDENTITY)
+                } else {
+                    renderInk.draw(canvas, item.stroke, AffineTransform.IDENTITY)
+                }
             }
             is ShapeItem -> {
                 shapePaint.color = item.color
                 shapePaint.strokeWidth = item.strokeWidthWorld
-                drawShape(canvas, item.shape, item.offsetX, item.offsetY)
+                drawShape(canvas, item.shape)
             }
+        }
+
+        if (applyTempDrag) {
+            canvas.restore()
         }
     }
 
-    private fun drawShape(canvas: Canvas, shape: RecognizedShape, ox: Float, oy: Float) {
+    private fun drawShape(canvas: Canvas, shape: RecognizedShape) {
         when (shape) {
             is RecognizedShape.Line -> {
                 canvas.drawLine(
-                    shape.start.x + ox, shape.start.y + oy,
-                    shape.end.x + ox, shape.end.y + oy,
+                    shape.start.x, shape.start.y,
+                    shape.end.x, shape.end.y,
                     shapePaint
                 )
             }
             is RecognizedShape.Arrow -> {
                 canvas.drawLine(
-                    shape.start.x + ox, shape.start.y + oy,
-                    shape.end.x + ox, shape.end.y + oy,
+                    shape.start.x, shape.start.y,
+                    shape.end.x, shape.end.y,
                     shapePaint
                 )
                 canvas.drawLine(
-                    shape.end.x + ox, shape.end.y + oy,
-                    shape.wingLeft.x + ox, shape.wingLeft.y + oy,
+                    shape.end.x, shape.end.y,
+                    shape.wingLeft.x, shape.wingLeft.y,
                     shapePaint
                 )
                 canvas.drawLine(
-                    shape.end.x + ox, shape.end.y + oy,
-                    shape.wingRight.x + ox, shape.wingRight.y + oy,
+                    shape.end.x, shape.end.y,
+                    shape.wingRight.x, shape.wingRight.y,
                     shapePaint
                 )
             }
             is RecognizedShape.Rectangle -> {
                 canvas.drawRect(
-                    shape.left + ox, shape.top + oy,
-                    shape.right + ox, shape.bottom + oy,
+                    shape.left, shape.top,
+                    shape.right, shape.bottom,
                     shapePaint
                 )
             }
             is RecognizedShape.Triangle -> {
                 val path = Path().apply {
-                    moveTo(shape.a.x + ox, shape.a.y + oy)
-                    lineTo(shape.b.x + ox, shape.b.y + oy)
-                    lineTo(shape.c.x + ox, shape.c.y + oy)
+                    moveTo(shape.a.x, shape.a.y)
+                    lineTo(shape.b.x, shape.b.y)
+                    lineTo(shape.c.x, shape.c.y)
                     close()
                 }
                 canvas.drawPath(path, shapePaint)
             }
             is RecognizedShape.Ellipse -> {
                 canvas.drawOval(
-                    shape.cx - shape.rx + ox,
-                    shape.cy - shape.ry + oy,
-                    shape.cx + shape.rx + ox,
-                    shape.cy + shape.ry + oy,
+                    shape.cx - shape.rx,
+                    shape.cy - shape.ry,
+                    shape.cx + shape.rx,
+                    shape.cy + shape.ry,
                     shapePaint
                 )
             }
@@ -514,27 +564,44 @@ class PenSheet(
 
         wetInk.addFinishedStrokesListener(object : InProgressStrokesFinishedListener {
             override fun onStrokesFinished(strokes: Map<InProgressStrokeId, Stroke>) {
-                for ((id, stroke) in strokes) {
+                for ((id, rawStroke) in strokes) {
                     val meta = waitingForInk.remove(id)
+                    if (meta == null) {
+                        Log.e(TAG, "onStrokesFinished: missing PendingStrokeMeta for $id; discarding stroke")
+                        continue
+                    }
                     rememberBeforeChange()
-                    if (meta?.snappedShape != null) {
+                    if (meta.snappedShape != null) {
+                        val shapeBounds = meta.snappedShape.computeWorldBounds(meta.sizeWorld)
                         items.add(
                             ShapeItem(
+                                id = allocateId(),
                                 shape = meta.snappedShape,
                                 color = meta.color,
-                                strokeWidthWorld = meta.strokeWidthWorld,
+                                strokeWidthWorld = meta.sizeWorld,
+                                worldBounds = shapeBounds,
                                 isHighlighter = meta.isHighlighter
                             )
                         )
                         lastShapeDetected = meta.snappedShape.label
                     } else {
+                        val (strokeData, worldStroke) = normalizeAndRebuildStroke(rawStroke, meta)
+                        val bounds = computeStrokeWorldBounds(worldStroke, strokeData)
+                        val redBrush = rawStroke.brush.copyWithColorIntArgb(0xFFFF1744.toInt())
+                        val debugRaw = DebugRawStroke(
+                            redStroke = rawStroke.copy(redBrush),
+                            creationScale = meta.scale,
+                            creationPanX = meta.panX,
+                            creationPanY = meta.panY
+                        )
                         items.add(
                             InkItem(
-                                stroke = stroke,
-                                creationScale = meta?.scale ?: viewScale,
-                                creationPanX = meta?.panX ?: panX,
-                                creationPanY = meta?.panY ?: panY,
-                                isHighlighter = meta?.isHighlighter ?: (toolMode == ToolMode.HIGHLIGHTER)
+                                id = allocateId(),
+                                data = strokeData,
+                                stroke = worldStroke,
+                                worldBounds = bounds,
+                                isHighlighter = meta.isHighlighter,
+                                debugRaw = debugRaw
                             )
                         )
                     }
@@ -613,7 +680,14 @@ class PenSheet(
             MotionEvent.ACTION_CANCEL -> {
                 cancellations++
                 mainHandler.removeCallbacks(holdRunnable)
-                activeInk?.let { wetInk.cancelStroke(it, event) }
+                activeInk?.let { id ->
+                    waitingForInk.remove(id)
+                    wetInk.cancelStroke(id, event)
+                }
+                isDraggingSelection = false
+                selectionDragLastWorld = null
+                dragDx = 0f
+                dragDy = 0f
                 endPen()
                 emitTelemetry()
             }
@@ -677,13 +751,16 @@ class PenSheet(
         if (toolMode == ToolMode.LASSO) {
             val wx = screenToWorldX(x)
             val wy = screenToWorldY(y)
-            if (selectedItems.isNotEmpty() && computeSelectionBounds().contains(wx, wy)) {
+            if (selectedIds.isNotEmpty() && computeSelectionBounds().contains(wx, wy)) {
                 isDraggingSelection = true
                 selectionDragLastWorld = PointF(wx, wy)
-                rememberBeforeChange()
+                dragDx = 0f
+                dragDy = 0f
             } else {
-                selectedItems.clear()
+                selectedIds.clear()
                 isDraggingSelection = false
+                dragDx = 0f
+                dragDy = 0f
                 lassoPathWorld.clear()
                 lassoPathWorld.add(PointF(wx, wy))
                 dryInk.invalidate()
@@ -692,16 +769,36 @@ class PenSheet(
             return
         }
 
+        // Capture camera at stroke start (beginPen)
+        val capturedScale = viewScale
+        val capturedPanX = panX
+        val capturedPanY = panY
         val isHighlighter = toolMode == ToolMode.HIGHLIGHTER
+        val brushType = if (isHighlighter) BrushType.HIGHLIGHTER else BrushType.PEN
         val activeColor = if (isHighlighter) highlighterColor else inkColor
         val sizePx = (if (isHighlighter) highlighterWidthDp else penWidthDp) * density
-        val brush = Brush.createWithColorIntArgb(penFamily, activeColor, sizePx, density / 5f)
-        activeInk = wetInk.startStroke(event, activePointer, brush)
+        val epsilonPx = density / 5f
+        val brush = Brush.createWithColorIntArgb(familyFor(brushType), activeColor, sizePx, epsilonPx)
+
+        val strokeId = wetInk.startStroke(event, activePointer, brush)
+        activeInk = strokeId
+        waitingForInk[strokeId] = PendingStrokeMeta(
+            scale = capturedScale,
+            panX = capturedPanX,
+            panY = capturedPanY,
+            brushType = brushType,
+            color = activeColor,
+            sizeWorld = sizePx / capturedScale,
+            epsilonWorld = epsilonPx / capturedScale,
+            isHighlighter = isHighlighter,
+            snappedShape = null
+        )
+
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
             predictor = MotionEventPredictor.newInstance(wetInk).also { it.record(event) }
         }
 
-        rawWorldPoints.add(PointF(screenToWorldX(x), screenToWorldY(y)))
+        rawWorldPoints.add(PointF((x - capturedPanX) / capturedScale, (y - capturedPanY) / capturedScale))
         scheduleHoldCheck(x, y)
     }
 
@@ -723,8 +820,10 @@ class PenSheet(
                 val dx = wx - prev.x
                 val dy = wy - prev.y
                 if (abs(dx) > 0.01f || abs(dy) > 0.01f) {
-                    moveSelectedItems(dx, dy)
+                    dragDx += dx
+                    dragDy += dy
                     selectionDragLastWorld = PointF(wx, wy)
+                    dryInk.postInvalidateOnAnimation()
                 }
             } else {
                 lassoPathWorld.add(PointF(wx, wy))
@@ -733,13 +832,18 @@ class PenSheet(
             return
         }
 
-        val stroke = activeInk ?: return
+        val strokeId = activeInk ?: return
+        val meta = waitingForInk[strokeId]
+        val sScale = meta?.scale ?: viewScale
+        val sPanX = meta?.panX ?: panX
+        val sPanY = meta?.panY ?: panY
+
         for (h in 0 until event.historySize) {
             val hx = event.getHistoricalX(index, h)
             val hy = event.getHistoricalY(index, h)
-            rawWorldPoints.add(PointF(screenToWorldX(hx), screenToWorldY(hy)))
+            rawWorldPoints.add(PointF((hx - sPanX) / sScale, (hy - sPanY) / sScale))
         }
-        rawWorldPoints.add(PointF(screenToWorldX(x), screenToWorldY(y)))
+        rawWorldPoints.add(PointF((x - sPanX) / sScale, (y - sPanY) / sScale))
 
         if (hypot(x - holdAnchorX, y - holdAnchorY) > 6f * density) {
             if (holdSnappedShape != null) {
@@ -752,7 +856,7 @@ class PenSheet(
         predictor?.record(event)
         val prediction = predictor?.predict()
         try {
-            wetInk.addToStroke(event, activePointer, stroke, prediction)
+            wetInk.addToStroke(event, activePointer, strokeId, prediction)
         } finally {
             prediction?.recycle()
         }
@@ -762,19 +866,32 @@ class PenSheet(
         mainHandler.removeCallbacks(holdRunnable)
         readPen(event, index)
         if (canceled) {
-            activeInk?.let { wetInk.cancelStroke(it, event) }
+            activeInk?.let { id ->
+                waitingForInk.remove(id)
+                wetInk.cancelStroke(id, event)
+            }
             lassoPathWorld.clear()
+            isDraggingSelection = false
+            selectionDragLastWorld = null
+            dragDx = 0f
+            dragDy = 0f
         } else if (erasing) {
             eraseAtScreen(x, y)
-            if (erased.isNotEmpty()) {
+            if (erasedIds.isNotEmpty()) {
                 rememberBeforeChange()
-                items.removeAll(erased)
-                selectedItems.removeAll(erased)
+                items.removeAll { it.id in erasedIds }
+                selectedIds.removeAll(erasedIds)
             }
         } else if (toolMode == ToolMode.LASSO) {
             if (isDraggingSelection) {
+                if (hypot(dragDx, dragDy) > 0.01f) {
+                    rememberBeforeChange()
+                    bakeSelectionDrag(dragDx, dragDy)
+                }
                 isDraggingSelection = false
                 selectionDragLastWorld = null
+                dragDx = 0f
+                dragDy = 0f
             } else {
                 selectItemsInsideLasso()
                 lassoPathWorld.clear()
@@ -782,25 +899,17 @@ class PenSheet(
             dryInk.invalidate()
             emitState()
         } else {
-            val isHighlighter = toolMode == ToolMode.HIGHLIGHTER
-            val activeColor = if (isHighlighter) highlighterColor else inkColor
-            val sizeWorld = ((if (isHighlighter) highlighterWidthDp else penWidthDp) * density) / viewScale
-
-            val finalShape = holdSnappedShape
-                ?: if (autoShapeEnabled) ShapeRecognizer.recognize(rawWorldPoints, density / viewScale) else null
-
-            activeInk?.let { stroke ->
+            activeInk?.let { strokeId ->
+                val existing = waitingForInk[strokeId]
+                if (existing != null) {
+                    val finalShape = holdSnappedShape
+                        ?: if (autoShapeEnabled) ShapeRecognizer.recognize(rawWorldPoints, density / existing.scale) else null
+                    waitingForInk[strokeId] = existing.copy(snappedShape = finalShape)
+                } else {
+                    Log.e(TAG, "finishPen: missing PendingStrokeMeta for $strokeId")
+                }
                 predictor?.record(event)
-                waitingForInk[stroke] = PendingStrokeMeta(
-                    scale = viewScale,
-                    panX = panX,
-                    panY = panY,
-                    isHighlighter = isHighlighter,
-                    color = activeColor,
-                    strokeWidthWorld = sizeWorld,
-                    snappedShape = finalShape
-                )
-                wetInk.finishStroke(event, activePointer, stroke)
+                wetInk.finishStroke(event, activePointer, strokeId)
             }
         }
         endPen()
@@ -815,8 +924,8 @@ class PenSheet(
         lastEraseWorld = null
         holdSnappedShape = null
         rawWorldPoints.clear()
-        if (erased.isNotEmpty()) {
-            erased.clear()
+        if (erasedIds.isNotEmpty()) {
+            erasedIds.clear()
             dryInk.invalidate()
         }
     }
@@ -829,8 +938,10 @@ class PenSheet(
     }
 
     private fun trySnapHoldShape() {
-        if (activeInk == null || erasing || toolMode == ToolMode.LASSO) return
-        val recognized = ShapeRecognizer.recognize(rawWorldPoints, density / viewScale)
+        val strokeId = activeInk ?: return
+        if (erasing || toolMode == ToolMode.LASSO) return
+        val scale = waitingForInk[strokeId]?.scale ?: viewScale
+        val recognized = ShapeRecognizer.recognize(rawWorldPoints, density / scale)
         if (recognized != null) {
             holdSnappedShape = recognized
             dryInk.postInvalidateOnAnimation()
@@ -843,7 +954,7 @@ class PenSheet(
         val worldRadius = (eraserRadiusDp * density) / viewScale
         val start = lastEraseWorld ?: PointF(wx, wy)
         val steps = ceil(hypot(wx - start.x, wy - start.y) / worldRadius).toInt().coerceAtLeast(1)
-        val before = erased.size
+        val before = erasedIds.size
 
         for (step in 1..steps) {
             val progress = step.toFloat() / steps
@@ -851,14 +962,17 @@ class PenSheet(
             val py = start.y + (wy - start.y) * progress
 
             for (item in items) {
-                if (item in erased) continue
+                if (item.id in erasedIds) continue
+                val b = item.worldBounds
+                if (px < b.left - worldRadius || px > b.right + worldRadius ||
+                    py < b.top - worldRadius || py > b.bottom + worldRadius
+                ) {
+                    continue
+                }
                 val hit = when (item) {
                     is InkItem -> {
-                        val ix = (px - item.offsetX) * item.creationScale + item.creationPanX
-                        val iy = (py - item.offsetY) * item.creationScale + item.creationPanY
-                        val r = worldRadius * item.creationScale
                         val area = ImmutableBox.fromCenterAndDimensions(
-                            ImmutableVec(ix, iy), 2 * r, 2 * r
+                            ImmutableVec(px, py), 2f * worldRadius, 2f * worldRadius
                         )
                         area.intersects(item.stroke.shape, AffineTransform.IDENTITY)
                     }
@@ -866,22 +980,22 @@ class PenSheet(
                         val pts = item.shape.samplePoints(8f)
                         val threshold = worldRadius + item.strokeWidthWorld * 0.5f
                         pts.any { pt ->
-                            hypot((pt.x + item.offsetX) - px, (pt.y + item.offsetY) - py) <= threshold
+                            hypot(pt.x - px, pt.y - py) <= threshold
                         }
                     }
                 }
-                if (hit) erased.add(item)
+                if (hit) erasedIds.add(item.id)
             }
         }
         lastEraseWorld = PointF(wx, wy)
-        if (before != erased.size) dryInk.postInvalidateOnAnimation()
+        if (before != erasedIds.size) dryInk.postInvalidateOnAnimation()
     }
 
     private fun selectItemsInsideLasso() {
-        selectedItems.clear()
+        selectedIds.clear()
         if (lassoPathWorld.size < 3) return
         for (item in items) {
-            val b = item.worldBounds()
+            val b = item.worldBounds
             if (b.isEmpty) continue
             val cx = b.centerX()
             val cy = b.centerY()
@@ -889,7 +1003,7 @@ class PenSheet(
                 isPointInPolygon(b.left, b.top, lassoPathWorld) ||
                 isPointInPolygon(b.right, b.bottom, lassoPathWorld)
             ) {
-                selectedItems.add(item)
+                selectedIds.add(item.id)
             }
         }
     }
@@ -912,54 +1026,61 @@ class PenSheet(
 
     private fun computeSelectionBounds(): RectF {
         val out = RectF()
-        for (item in selectedItems) {
-            val b = item.worldBounds()
-            if (!b.isEmpty) {
-                if (out.isEmpty) out.set(b) else out.union(b)
+        for (item in items) {
+            if (item.id in selectedIds) {
+                val b = item.worldBounds
+                if (!b.isEmpty) {
+                    if (out.isEmpty) out.set(b) else out.union(b)
+                }
             }
+        }
+        if (!out.isEmpty && isDraggingSelection) {
+            out.offset(dragDx, dragDy)
         }
         return out
     }
 
-    private fun moveSelectedItems(dx: Float, dy: Float) {
-        val updatedSelection = mutableSetOf<CanvasItem>()
+    private fun bakeSelectionDrag(dx: Float, dy: Float) {
         for (i in items.indices) {
             val item = items[i]
-            if (item in selectedItems) {
-                val moved = item.translated(dx, dy)
-                items[i] = moved
-                updatedSelection.add(moved)
+            if (item.id in selectedIds) {
+                items[i] = item.translated(dx, dy, newId = item.id)
             }
         }
-        selectedItems.clear()
-        selectedItems.addAll(updatedSelection)
-        dryInk.postInvalidateOnAnimation()
     }
 
     fun deleteSelection() {
-        if (isWriting || selectedItems.isEmpty()) return
+        if (isWriting || selectedIds.isEmpty()) return
         rememberBeforeChange()
-        items.removeAll(selectedItems)
-        selectedItems.clear()
+        items.removeAll { it.id in selectedIds }
+        selectedIds.clear()
         dryInk.invalidate()
         emitState()
     }
 
     fun duplicateSelection() {
-        if (isWriting || selectedItems.isEmpty()) return
+        if (isWriting || selectedIds.isEmpty()) return
         rememberBeforeChange()
         val shift = 24f * density / viewScale
-        val clones = selectedItems.map { it.translated(shift, shift) }
+        val newSelected = mutableSetOf<Long>()
+        val clones = items.filter { it.id in selectedIds }.map { item ->
+            val freshId = allocateId()
+            newSelected.add(freshId)
+            item.translated(shift, shift, newId = freshId)
+        }
         items.addAll(clones)
-        selectedItems.clear()
-        selectedItems.addAll(clones)
+        selectedIds.clear()
+        selectedIds.addAll(newSelected)
         dryInk.invalidate()
         emitState()
     }
 
     fun clearSelection() {
-        if (selectedItems.isEmpty()) return
-        selectedItems.clear()
+        if (selectedIds.isEmpty()) return
+        selectedIds.clear()
+        isDraggingSelection = false
+        dragDx = 0f
+        dragDy = 0f
         dryInk.invalidate()
         emitState()
     }
@@ -968,6 +1089,48 @@ class PenSheet(
         viewScale = 1f
         panX = 0f
         panY = 0f
+        dryInk.invalidate()
+        emitTelemetry()
+    }
+
+    /** Fits all content within a 32 dp margin (clamped to 45%..400%). Aligns top-left if content exceeds view at 45%. */
+    fun fitToContent() {
+        if (items.isEmpty() || width <= 0 || height <= 0) {
+            resetZoom()
+            return
+        }
+        val contentBounds = RectF()
+        for (item in items) {
+            val b = item.worldBounds
+            if (!b.isEmpty) {
+                if (contentBounds.isEmpty) contentBounds.set(b) else contentBounds.union(b)
+            }
+        }
+        if (contentBounds.isEmpty) {
+            resetZoom()
+            return
+        }
+
+        val marginPx = 32f * density
+        val availW = (width - 2f * marginPx).coerceAtLeast(1f)
+        val availH = (height - 2f * marginPx).coerceAtLeast(1f)
+        val cw = contentBounds.width().coerceAtLeast(1f)
+        val ch = contentBounds.height().coerceAtLeast(1f)
+
+        val idealScale = min(availW / cw, availH / ch)
+        val targetScale = idealScale.coerceIn(0.45f, 4.0f)
+
+        viewScale = targetScale
+        panX = if (cw * targetScale > availW) {
+            marginPx - contentBounds.left * targetScale
+        } else {
+            width * 0.5f - contentBounds.centerX() * targetScale
+        }
+        panY = if (ch * targetScale > availH) {
+            marginPx - contentBounds.top * targetScale
+        } else {
+            height * 0.5f - contentBounds.centerY() * targetScale
+        }
         dryInk.invalidate()
         emitTelemetry()
     }
@@ -984,7 +1147,7 @@ class PenSheet(
         redoHistory.addLast(items.toList())
         items.clear()
         items.addAll(undoHistory.removeLast())
-        selectedItems.clear()
+        selectedIds.clear()
         dryInk.invalidate()
         emitState()
         return true
@@ -995,7 +1158,7 @@ class PenSheet(
         undoHistory.addLast(items.toList())
         items.clear()
         items.addAll(redoHistory.removeLast())
-        selectedItems.clear()
+        selectedIds.clear()
         dryInk.invalidate()
         emitState()
         return true
@@ -1005,24 +1168,24 @@ class PenSheet(
         if (isWriting || items.isEmpty()) return
         rememberBeforeChange()
         items.clear()
-        selectedItems.clear()
+        selectedIds.clear()
         dryInk.invalidate()
         emitState()
     }
 
     fun exportBitmap(): Bitmap? {
         if (width <= 0 || height <= 0) return null
-        val prevSelected = selectedItems.toSet()
-        selectedItems.clear()
+        val prevSelected = selectedIds.toSet()
+        selectedIds.clear()
         val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         dryInk.draw(canvas)
-        selectedItems.addAll(prevSelected)
+        selectedIds.addAll(prevSelected)
         return bmp
     }
 
     private fun emitState() {
-        onStateChanged(undoHistory.isNotEmpty(), redoHistory.isNotEmpty(), selectedItems.isNotEmpty())
+        onStateChanged(undoHistory.isNotEmpty(), redoHistory.isNotEmpty(), selectedIds.isNotEmpty())
     }
 
     private fun emitTelemetry() {
@@ -1038,4 +1201,107 @@ class PenSheet(
             )
         )
     }
+
+    private fun normalizeAndRebuildStroke(
+        rawStroke: Stroke,
+        meta: PendingStrokeMeta
+    ): Pair<StrokeData, Stroke> {
+        val inputs = rawStroke.inputs
+        val count = inputs.size
+        val pts = ArrayList<StrokePoint>(count)
+        val scratch = StrokeInput()
+        for (i in 0 until count) {
+            inputs.populate(i, scratch)
+            val wx = (scratch.x - meta.panX) / meta.scale
+            val wy = (scratch.y - meta.panY) / meta.scale
+            val unitCm = if (scratch.strokeUnitLengthCm != StrokeInput.NO_STROKE_UNIT_LENGTH) {
+                scratch.strokeUnitLengthCm * meta.scale
+            } else {
+                StrokeInput.NO_STROKE_UNIT_LENGTH
+            }
+            pts.add(
+                StrokePoint(
+                    x = wx,
+                    y = wy,
+                    elapsedTimeMillis = scratch.elapsedTimeMillis,
+                    pressure = scratch.pressure,
+                    tiltRadians = scratch.tiltRadians,
+                    orientationRadians = scratch.orientationRadians,
+                    strokeUnitLengthCm = unitCm
+                )
+            )
+        }
+        val sizeWorld = rawStroke.brush.size / meta.scale
+        val epsilonWorld = rawStroke.brush.epsilon / meta.scale
+        val data = StrokeData(
+            brushType = meta.brushType,
+            color = rawStroke.brush.colorIntArgb,
+            sizeWorld = sizeWorld,
+            epsilonWorld = epsilonWorld,
+            isHighlighter = meta.isHighlighter,
+            toolTypeInt = inputs.toolType.value,
+            noiseSeed = inputs.noiseSeed,
+            points = pts
+        )
+        val worldStroke = buildStrokeFromData(data)
+        return data to worldStroke
+    }
+}
+
+private fun familyFor(type: BrushType): BrushFamily = when (type) {
+    BrushType.PEN -> StockBrushes.pressurePen()
+    BrushType.PENCIL -> StockBrushes.marker()
+    BrushType.HIGHLIGHTER -> StockBrushes.pressurePen()
+}
+
+internal fun buildStrokeFromData(data: StrokeData): Stroke {
+    val brush = Brush.createWithColorIntArgb(
+        familyFor(data.brushType),
+        data.color,
+        data.sizeWorld,
+        data.epsilonWorld
+    )
+    val batch = MutableStrokeInputBatch()
+    batch.setNoiseSeed(data.noiseSeed)
+    val toolType = InputToolType.fromInt(data.toolTypeInt)
+    for (pt in data.points) {
+        runCatching {
+            batch.add(
+                toolType,
+                pt.x,
+                pt.y,
+                pt.elapsedTimeMillis,
+                pt.strokeUnitLengthCm,
+                pt.pressure,
+                pt.tiltRadians,
+                pt.orientationRadians
+            )
+        }
+    }
+    return Stroke(brush, batch)
+}
+
+internal fun computeStrokeWorldBounds(stroke: Stroke, data: StrokeData): RectF {
+    val pad = data.sizeWorld * 0.5f + data.epsilonWorld + 2f
+    val box = stroke.shape.computeBoundingBox()
+    if (box != null) {
+        return RectF(
+            box.xMin - pad,
+            box.yMin - pad,
+            box.xMax + pad,
+            box.yMax + pad
+        )
+    }
+    if (data.points.isEmpty()) return RectF()
+    var minX = Float.POSITIVE_INFINITY
+    var minY = Float.POSITIVE_INFINITY
+    var maxX = Float.NEGATIVE_INFINITY
+    var maxY = Float.NEGATIVE_INFINITY
+    for (p in data.points) {
+        if (p.x < minX) minX = p.x
+        if (p.x > maxX) maxX = p.x
+        if (p.y < minY) minY = p.y
+        if (p.y > maxY) maxY = p.y
+    }
+    return RectF(minX - pad, minY - pad, maxX + pad, maxY + pad)
 }

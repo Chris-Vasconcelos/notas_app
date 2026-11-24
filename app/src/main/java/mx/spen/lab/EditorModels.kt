@@ -9,6 +9,41 @@ enum class ToolMode(val label: String) {
     LASSO("Lazo")
 }
 
+enum class BrushType(val code: Int) {
+    PEN(1),
+    PENCIL(2),
+    HIGHLIGHTER(3);
+
+    companion object {
+        fun fromCode(code: Int): BrushType = entries.firstOrNull { it.code == code } ?: PEN
+    }
+}
+
+data class StrokePoint(
+    val x: Float,
+    val y: Float,
+    val elapsedTimeMillis: Long,
+    val pressure: Float,
+    val tiltRadians: Float,
+    val orientationRadians: Float,
+    val strokeUnitLengthCm: Float
+)
+
+data class StrokeData(
+    val brushType: BrushType,
+    val color: Int,
+    val sizeWorld: Float,
+    val epsilonWorld: Float,
+    val isHighlighter: Boolean,
+    val toolTypeInt: Int,
+    val noiseSeed: Int,
+    val points: List<StrokePoint>
+) {
+    fun translated(dx: Float, dy: Float): StrokeData = copy(
+        points = points.map { pt -> pt.copy(x = pt.x + dx, y = pt.y + dy) }
+    )
+}
+
 enum class PaperStyle(
     val label: String,
     val bgColor: Int,
