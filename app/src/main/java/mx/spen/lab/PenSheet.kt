@@ -1239,13 +1239,27 @@ class PenSheet(
             sizeWorld = sizeWorld,
             epsilonWorld = epsilonWorld,
             isHighlighter = meta.isHighlighter,
-            toolTypeInt = inputs.toolType.value,
+            toolTypeInt = inputs.toolType.toCode(),
             noiseSeed = inputs.noiseSeed,
             points = pts
         )
         val worldStroke = buildStrokeFromData(data)
         return data to worldStroke
     }
+}
+
+private fun InputToolType.toCode(): Int = when (this) {
+    InputToolType.STYLUS -> 1
+    InputToolType.TOUCH -> 2
+    InputToolType.MOUSE -> 3
+    else -> 0
+}
+
+private fun toolTypeFromCode(code: Int): InputToolType = when (code) {
+    1 -> InputToolType.STYLUS
+    2 -> InputToolType.TOUCH
+    3 -> InputToolType.MOUSE
+    else -> InputToolType.UNKNOWN
 }
 
 private fun familyFor(type: BrushType): BrushFamily = when (type) {
@@ -1263,7 +1277,7 @@ internal fun buildStrokeFromData(data: StrokeData): Stroke {
     )
     val batch = MutableStrokeInputBatch()
     batch.setNoiseSeed(data.noiseSeed)
-    val toolType = InputToolType.fromInt(data.toolTypeInt)
+    val toolType = toolTypeFromCode(data.toolTypeInt)
     for (pt in data.points) {
         runCatching {
             batch.add(
