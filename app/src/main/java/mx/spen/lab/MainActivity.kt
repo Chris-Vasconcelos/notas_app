@@ -161,6 +161,26 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier.fillMaxSize()
                         )
 
+                        // Floating feedback pill for detected shapes
+                        telemetry.lastShapeDetected?.let { shapeName ->
+                            Surface(
+                                color = GraphiteSurface.copy(alpha = 0.92f),
+                                shape = RoundedCornerShape(20.dp),
+                                border = BorderStroke(1.dp, Petroleum.copy(alpha = 0.7f)),
+                                shadowElevation = 4.dp,
+                                modifier = Modifier
+                                    .align(Alignment.TopCenter)
+                                    .padding(top = 10.dp)
+                            ) {
+                                Text(
+                                    text = "✓ $shapeName",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = InkTextPrimary,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
+
                         // Floating lasso action bar
                         androidx.compose.animation.AnimatedVisibility(
                             visible = hasSelection,

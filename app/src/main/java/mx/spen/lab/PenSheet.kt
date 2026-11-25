@@ -525,6 +525,38 @@ class PenSheet(
                     shapePaint
                 )
             }
+            is RecognizedShape.Polygon -> {
+                val verts = shape.vertices
+                if (verts.size >= 2) {
+                    val path = Path().apply {
+                        moveTo(verts[0].x, verts[0].y)
+                        for (i in 1 until verts.size) {
+                            lineTo(verts[i].x, verts[i].y)
+                        }
+                        close()
+                    }
+                    canvas.drawPath(path, shapePaint)
+                }
+            }
+            is RecognizedShape.Polyline -> {
+                val verts = shape.vertices
+                if (verts.size >= 2) {
+                    val path = Path().apply {
+                        moveTo(verts[0].x, verts[0].y)
+                        for (i in 1 until verts.size) {
+                            lineTo(verts[i].x, verts[i].y)
+                        }
+                    }
+                    canvas.drawPath(path, shapePaint)
+                }
+            }
+            is RecognizedShape.Arc -> {
+                val path = Path().apply {
+                    moveTo(shape.start.x, shape.start.y)
+                    quadTo(shape.control.x, shape.control.y, shape.end.x, shape.end.y)
+                }
+                canvas.drawPath(path, shapePaint)
+            }
         }
     }
 
