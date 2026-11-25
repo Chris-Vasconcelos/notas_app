@@ -1,5 +1,6 @@
 package mx.spen.lab
 
+import android.graphics.RectF
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -11,7 +12,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
@@ -28,6 +28,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -58,6 +59,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import java.util.Locale
+import kotlin.math.max
 import kotlin.math.roundToInt
 
 private val ActiveTile = Color(0xff23393c)
@@ -75,6 +77,12 @@ data class PenPreset(
 internal fun TopEditorBar(
     title: String,
     zoomPercent: Int,
+    activeLayerName: String,
+    rulerEnabled: Boolean,
+    onToggleRuler: () -> Unit,
+    minimapOpen: Boolean,
+    onToggleMinimap: () -> Unit,
+    onOpenLayers: () -> Unit,
     readingMode: Boolean,
     onToggleReadingMode: () -> Unit,
     focusMode: Boolean,
@@ -83,6 +91,8 @@ internal fun TopEditorBar(
     canRedo: Boolean,
     revealAllTapes: Boolean,
     onToggleRevealTapes: () -> Unit,
+    fixedToolbarMode: Boolean,
+    onToggleFixedToolbarMode: () -> Unit,
     onFitContent: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
@@ -96,8 +106,8 @@ internal fun TopEditorBar(
     Row(
         Modifier
             .fillMaxWidth()
-            .padding(start = 14.dp, end = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
+            .padding(start = 12.dp, end = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(1.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(
@@ -108,21 +118,27 @@ internal fun TopEditorBar(
         ) {
             Text(
                 title,
-                style = MaterialTheme.typography.titleMedium,
+                style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
             Text(
-                if (readingMode) "${zoomPercent}% · Modo lectura" else "${zoomPercent}% · Toca para encajar",
-                style = MaterialTheme.typography.labelMedium,
-                color = if (readingMode) Mint else InkTextSecondary
+                if (readingMode) "${zoomPercent}% · Lectura · $activeLayerName"
+                else "${zoomPercent}% · $activeLayerName",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (readingMode) Mint else InkTextSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
         HeaderButton("Deshacer", EditorGlyph.Undo, enabled = canUndo, action = onUndo)
         HeaderButton("Rehacer", EditorGlyph.Redo, enabled = canRedo, action = onRedo)
+        HeaderButton("Regla virtual", EditorGlyph.Ruler, active = rulerEnabled, action = onToggleRuler)
+        HeaderButton("Capas", EditorGlyph.Layers, action = onOpenLayers)
+        HeaderButton("Minimapa de lienzo infinito", EditorGlyph.Minimap, active = minimapOpen, action = onToggleMinimap)
         HeaderButton(
-            label = if (readingMode) "Pasar a modo escritura" else "Modo lectura (desplazar con 1 dedo)",
+            label = if (readingMode) "Pasar a modo escritura" else "Modo lectura",
             glyph = EditorGlyph.Reading,
             active = readingMode,
             action = onToggleReadingMode
@@ -138,17 +154,36 @@ internal fun TopEditorBar(
             HeaderButton("Más opciones", EditorGlyph.Menu) { expanded = true }
             DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
                 DropdownMenuItem(
-                    text = { Text("Ajustar hoja a pantalla") },
+                    text = { Text("Ajustar hoja a pantalla (Doble toque)") },
                     onClick = {
                         expanded = false
                         onFitContent()
                     }
                 )
                 DropdownMenuItem(
-                    text = { Text("Papel y plantilla") },
+                    text = { Text("Papel, cuadrícula y opacidad") },
                     onClick = {
                         expanded = false
                         onOpenPaper()
+                    }
+                )
+                DropdownMenuItem(
+                    text = { Text("Capas del documento") },
+                    onClick = {
+                        expanded = false
+                        onOpenLayers()
+                    }
+                )
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            if (fixedToolbarMode) "Cambiar a estuche flotante movible"
+                            else "Cambiar a barra fija tradicional"
+                        )
+                    },
+                    onClick = {
+                        expanded = false
+                        onToggleFixedToolbarMode()
                     }
                 )
                 DropdownMenuItem(
@@ -203,7 +238,7 @@ private fun HeaderButton(
 ) {
     Box(
         Modifier
-            .size(44.dp)
+            .size(40.dp)
             .clip(SheetActions)
             .background(if (active) ActiveTile else Color.Transparent)
             .clickable(enabled = enabled, role = Role.Button, onClick = action)
@@ -214,12 +249,72 @@ private fun HeaderButton(
     }
 }
 
+/** Traditional Fixed Toolbar option (Section 14 · 常规工具栏). */
+@Composable
+internal fun FixedTopToolBar(
+    activeTool: ToolMode,
+    activeColor: Color,
+    currentWidthDp: Float,
+    strokePanelOpen: Boolean,
+    favorites: List<PenPreset>,
+    onSelectTool: (ToolMode) -> Unit,
+    onToggleStrokePanel: () -> Unit,
+    onQuickWidthSelect: (Float) -> Unit,
+    onApplyFavorite: (PenPreset) -> Unit
+) {
+    Surface(
+        color = GraphiteSurface,
+        border = BorderStroke(0.5.dp, GraphiteBorder),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            ToolMode.entries.forEach { tool ->
+                val selected = activeTool == tool
+                DockTile(
+                    label = tool.label,
+                    glyph = glyphForTool(tool),
+                    active = selected,
+                    interaction = Modifier
+                        .width(50.dp)
+                        .semantics { this.selected = selected }
+                        .clickable(role = Role.Button) {
+                            if (selected) onToggleStrokePanel() else onSelectTool(tool)
+                        }
+                )
+            }
+            DockTile(
+                label = String.format(Locale.getDefault(), "%.0fdp", currentWidthDp),
+                glyph = EditorGlyph.Swatch,
+                active = strokePanelOpen,
+                interaction = Modifier
+                    .width(50.dp)
+                    .clickable(role = Role.Button, onClick = onToggleStrokePanel),
+                swatch = activeColor
+            )
+            QuickWidthDots(
+                isVertical = false,
+                activeTool = activeTool,
+                currentWidthDp = currentWidthDp,
+                onSelectWidth = onQuickWidthSelect
+            )
+            favorites.forEach { preset ->
+                FavoriteChip(preset = preset, onClick = { onApplyFavorite(preset) })
+            }
+        }
+    }
+}
+
 /**
- * Notein-inspired movable floating pencil box ("笔盒"):
- * - Draggable across the entire canvas via the grip handle
- * - Automatically switches to Vertical orientation when docked near Left/Right edges, or Horizontal near Top/Bottom
- * - Collapses into a floating pen bubble when minimized or dragged to a corner
- * - Includes 1-tap favorite presets and quick thickness dots
+ * Notein-inspired movable floating pencil box ("笔盒", Section 08 & 11):
+ * - Draggable across the entire canvas
+ * - Dragging to Left/Right edges snaps Vertically; Top/Bottom snaps Horizontally
+ * - Dragging to any of the 4 corners automatically collapses into the compact pen-nib badge!
  */
 @Composable
 internal fun MovablePenBox(
@@ -227,18 +322,16 @@ internal fun MovablePenBox(
     activeTool: ToolMode,
     activeColor: Color,
     currentWidthDp: Float,
-    autoShapeEnabled: Boolean,
     strokePanelOpen: Boolean,
     favorites: List<PenPreset>,
     onSelectTool: (ToolMode) -> Unit,
     onToggleStrokePanel: () -> Unit,
-    onToggleAutoShape: () -> Unit,
     onQuickWidthSelect: (Float) -> Unit,
     onApplyFavorite: (PenPreset) -> Unit
 ) {
     val density = LocalDensity.current
     val defaultMarginPx = with(density) { 12.dp.toPx() }
-    val defaultBottomOffsetPx = with(density) { 78.dp.toPx() }
+    val defaultBottomOffsetPx = with(density) { 80.dp.toPx() }
 
     var offsetX by remember { mutableFloatStateOf(defaultMarginPx) }
     var offsetY by remember(containerSize.height) {
@@ -252,11 +345,12 @@ internal fun MovablePenBox(
     }
     var isVertical by remember { mutableStateOf(false) }
     var isCollapsed by remember { mutableStateOf(false) }
+    var showFavoritesDrawer by remember { mutableStateOf(true) }
 
     val maxW = containerSize.width.toFloat().coerceAtLeast(320f)
     val maxH = containerSize.height.toFloat().coerceAtLeast(480f)
 
-    fun clampAndSnap( snapEdges: Boolean) {
+    fun clampAndSnap(snapEdges: Boolean) {
         val boxW = with(density) {
             when {
                 isCollapsed -> 54.dp.toPx()
@@ -267,27 +361,33 @@ internal fun MovablePenBox(
         val boxH = with(density) {
             when {
                 isCollapsed -> 54.dp.toPx()
-                isVertical -> 370.dp.toPx().coerceAtMost(maxH - 24f)
+                isVertical -> 380.dp.toPx().coerceAtMost(maxH - 24f)
                 else -> 76.dp.toPx()
             }
         }
-        offsetX = offsetX.coerceIn(8f, (maxW - boxW - 8f).coerceAtLeast(8f))
-        offsetY = offsetY.coerceIn(8f, (maxH - boxH - 8f).coerceAtLeast(8f))
+        offsetX = offsetX.coerceIn(6f, (maxW - boxW - 6f).coerceAtLeast(6f))
+        offsetY = offsetY.coerceIn(6f, (maxH - boxH - 6f).coerceAtLeast(6f))
 
         if (snapEdges && !isCollapsed) {
-            val sideThreshold = with(density) { 44.dp.toPx() }
-            val cornerThreshold = with(density) { 40.dp.toPx() }
+            val sideThreshold = with(density) { 46.dp.toPx() }
+            val cornerThreshold = with(density) { 46.dp.toPx() }
             val nearLeft = offsetX <= sideThreshold
             val nearRight = offsetX >= maxW - boxW - sideThreshold
             val nearTop = offsetY <= cornerThreshold
             val nearBottom = offsetY >= maxH - boxH - cornerThreshold
 
-            // Auto-switch orientation when dragged to left/right sides vs top/bottom
-            if ((nearLeft || nearRight) && !nearTop && !nearBottom) {
+            // Section 08: Dragging into any of the 4 corners auto-collapses into the compact pen badge!
+            if ((nearLeft || nearRight) && (nearTop || nearBottom)) {
+                isCollapsed = true
+                val badgePx = with(density) { 54.dp.toPx() }
+                offsetX = if (nearLeft) 10f else (maxW - badgePx - 10f).coerceAtLeast(10f)
+                offsetY = if (nearTop) 10f else (maxH - badgePx - 10f).coerceAtLeast(10f)
+            } else if (nearLeft || nearRight) {
                 isVertical = true
                 offsetX = if (nearLeft) 10f else (maxW - with(density) { 68.dp.toPx() } - 10f).coerceAtLeast(10f)
             } else if (nearTop || nearBottom) {
                 isVertical = false
+                offsetY = if (nearTop) 10f else (maxH - with(density) { 76.dp.toPx() } - 10f).coerceAtLeast(10f)
             }
         }
     }
@@ -308,14 +408,14 @@ internal fun MovablePenBox(
         modifier = Modifier.offset { IntOffset(offsetX.roundToInt(), offsetY.roundToInt()) }
     ) {
         if (isCollapsed) {
-            // Compact floating pen bubble (draggable & expandable)
+            // Compact dark rounded-square pen-nib badge (Notein corner pen icon)
             Surface(
-                color = GraphiteSurface.copy(alpha = 0.95f),
+                color = GraphiteSurface.copy(alpha = 0.96f),
                 shape = RoundedCornerShape(16.dp),
-                border = BorderStroke(1.5.dp, Mint.copy(alpha = 0.7f)),
+                border = BorderStroke(1.5.dp, Mint.copy(alpha = 0.75f)),
                 shadowElevation = 10.dp,
                 modifier = dragModifier
-                    .size(52.dp)
+                    .size(54.dp)
                     .clickable {
                         isCollapsed = false
                         clampAndSnap(snapEdges = false)
@@ -335,7 +435,7 @@ internal fun MovablePenBox(
                 }
             }
         } else if (isVertical) {
-            // Vertical Floating Pencil Case (like Notein left/right dock)
+            // Vertical Floating Pencil Case
             Surface(
                 color = GraphiteSurface.copy(alpha = 0.96f),
                 shape = FloatingBoxShape,
@@ -348,12 +448,13 @@ internal fun MovablePenBox(
                         .padding(horizontal = 4.dp, vertical = 6.dp)
                         .verticalScroll(rememberScrollState()),
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                    verticalArrangement = Arrangement.spacedBy(3.dp)
                 ) {
-                    // Drag handle + orientation/collapse row
                     DragHandlePill(
                         isVertical = true,
                         dragModifier = dragModifier,
+                        showFavorites = showFavoritesDrawer,
+                        onToggleFavorites = { showFavoritesDrawer = !showFavoritesDrawer },
                         onRotate = {
                             isVertical = false
                             clampAndSnap(snapEdges = false)
@@ -371,43 +472,23 @@ internal fun MovablePenBox(
                                 .fillMaxWidth()
                                 .semantics { this.selected = selected }
                                 .clickable(role = Role.Button) {
-                                    if (selected && tool != ToolMode.LASSO && tool != ToolMode.LASER) {
-                                        onToggleStrokePanel()
-                                    } else {
-                                        onSelectTool(tool)
-                                    }
+                                    if (selected) onToggleStrokePanel() else onSelectTool(tool)
                                 }
                         )
                     }
 
                     HorizontalDivider(color = GraphiteBorder, modifier = Modifier.padding(vertical = 2.dp))
 
-                    // Auto-Shape toggle
-                    DockTile(
-                        label = "Formas",
-                        glyph = EditorGlyph.Shapes,
-                        active = autoShapeEnabled,
-                        interaction = Modifier
-                            .fillMaxWidth()
-                            .clickable(role = Role.Switch) { onToggleAutoShape() }
-                    )
-
-                    // Active Color & Width trigger
                     DockTile(
                         label = String.format(Locale.getDefault(), "%.0fdp", currentWidthDp),
                         glyph = EditorGlyph.Swatch,
                         active = strokePanelOpen,
                         interaction = Modifier
                             .fillMaxWidth()
-                            .clickable(
-                                enabled = activeTool != ToolMode.LASSO && activeTool != ToolMode.LASER,
-                                role = Role.Button,
-                                onClick = onToggleStrokePanel
-                            ),
+                            .clickable(role = Role.Button, onClick = onToggleStrokePanel),
                         swatch = activeColor
                     )
 
-                    // Quick 3 thickness dots (Fine / Medium / Bold)
                     QuickWidthDots(
                         isVertical = true,
                         activeTool = activeTool,
@@ -415,8 +496,7 @@ internal fun MovablePenBox(
                         onSelectWidth = onQuickWidthSelect
                     )
 
-                    // Favorite presets
-                    if (favorites.isNotEmpty()) {
+                    if (showFavoritesDrawer && favorites.isNotEmpty()) {
                         HorizontalDivider(color = GraphiteBorder, modifier = Modifier.padding(vertical = 2.dp))
                         favorites.forEach { preset ->
                             FavoriteChip(preset = preset, onClick = { onApplyFavorite(preset) })
@@ -442,6 +522,8 @@ internal fun MovablePenBox(
                     DragHandlePill(
                         isVertical = false,
                         dragModifier = dragModifier,
+                        showFavorites = showFavoritesDrawer,
+                        onToggleFavorites = { showFavoritesDrawer = !showFavoritesDrawer },
                         onRotate = {
                             isVertical = true
                             clampAndSnap(snapEdges = false)
@@ -456,44 +538,24 @@ internal fun MovablePenBox(
                             glyph = glyphForTool(tool),
                             active = selected,
                             interaction = Modifier
-                                .width(52.dp)
+                                .width(50.dp)
                                 .semantics { this.selected = selected }
                                 .clickable(role = Role.Button) {
-                                    if (selected && tool != ToolMode.LASSO && tool != ToolMode.LASER) {
-                                        onToggleStrokePanel()
-                                    } else {
-                                        onSelectTool(tool)
-                                    }
+                                    if (selected) onToggleStrokePanel() else onSelectTool(tool)
                                 }
                         )
                     }
 
-                    // Auto-Shape toggle
-                    DockTile(
-                        label = "Formas",
-                        glyph = EditorGlyph.Shapes,
-                        active = autoShapeEnabled,
-                        interaction = Modifier
-                            .width(52.dp)
-                            .clickable(role = Role.Switch) { onToggleAutoShape() }
-                    )
-
-                    // Color & Width Swatch
                     DockTile(
                         label = String.format(Locale.getDefault(), "%.0fdp", currentWidthDp),
                         glyph = EditorGlyph.Swatch,
                         active = strokePanelOpen,
                         interaction = Modifier
-                            .width(52.dp)
-                            .clickable(
-                                enabled = activeTool != ToolMode.LASSO && activeTool != ToolMode.LASER,
-                                role = Role.Button,
-                                onClick = onToggleStrokePanel
-                            ),
+                            .width(50.dp)
+                            .clickable(role = Role.Button, onClick = onToggleStrokePanel),
                         swatch = activeColor
                     )
 
-                    // Quick 3 thickness dots
                     QuickWidthDots(
                         isVertical = false,
                         activeTool = activeTool,
@@ -501,10 +563,129 @@ internal fun MovablePenBox(
                         onSelectWidth = onQuickWidthSelect
                     )
 
-                    // Favorite presets
-                    favorites.forEach { preset ->
-                        FavoriteChip(preset = preset, onClick = { onApplyFavorite(preset) })
+                    if (showFavoritesDrawer) {
+                        favorites.forEach { preset ->
+                            FavoriteChip(preset = preset, onClick = { onApplyFavorite(preset) })
+                        }
                     }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Infinite Canvas Minimap with draggable Blue Viewport Box (Section 03 · 无限画布 "蓝色方框").
+ */
+@Composable
+internal fun InfiniteCanvasMinimap(
+    worldBounds: RectF,
+    viewportBounds: RectF,
+    itemSnapshots: List<Pair<RectF, Int>>,
+    isDarkPaper: Boolean,
+    onJumpToWorld: (worldCx: Float, worldCy: Float) -> Unit,
+    onFitAll: () -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        color = GraphiteSurface.copy(alpha = 0.96f),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, GraphiteBorder),
+        shadowElevation = 10.dp,
+        modifier = modifier.width(196.dp)
+    ) {
+        Column(modifier = Modifier.padding(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Minimapa · Lienzo",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = InkTextPrimary,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    "×",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = InkTextSecondary,
+                    modifier = Modifier
+                        .clickable(onClick = onClose)
+                        .padding(horizontal = 4.dp)
+                )
+            }
+
+            val ww = max(1f, worldBounds.width())
+            val wh = max(1f, worldBounds.height())
+
+            Box(
+                modifier = Modifier
+                    .padding(top = 6.dp)
+                    .fillMaxWidth()
+                    .height(126.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(if (isDarkPaper) Color(0xFF16191F) else Color(0xFFF5F7FB))
+                    .border(1.dp, GraphiteBorder, RoundedCornerShape(10.dp))
+                    .pointerInput(worldBounds) {
+                        detectDragGestures { change, _ ->
+                            change.consume()
+                            val nx = (change.position.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f)
+                            val ny = (change.position.y / size.height.coerceAtLeast(1)).coerceIn(0f, 1f)
+                            onJumpToWorld(
+                                worldBounds.left + nx * ww,
+                                worldBounds.top + ny * wh
+                            )
+                        }
+                    }
+            ) {
+                Canvas(Modifier.matchParentSize()) {
+                    fun mapX(wx: Float): Float = ((wx - worldBounds.left) / ww) * size.width
+                    fun mapY(wy: Float): Float = ((wy - worldBounds.top) / wh) * size.height
+
+                    // Draw miniature items
+                    for ((rect, argb) in itemSnapshots) {
+                        val l = mapX(rect.left)
+                        val t = mapY(rect.top)
+                        val r = mapX(rect.right)
+                        val b = mapY(rect.bottom)
+                        drawRect(
+                            color = Color(argb),
+                            topLeft = Offset(l, t),
+                            size = Size(max(2f, r - l), max(2f, b - t))
+                        )
+                    }
+
+                    // Draw Blue Viewport Box ("蓝色方框")
+                    val vl = mapX(viewportBounds.left).coerceIn(0f, size.width)
+                    val vt = mapY(viewportBounds.top).coerceIn(0f, size.height)
+                    val vr = mapX(viewportBounds.right).coerceIn(0f, size.width)
+                    val vb = mapY(viewportBounds.bottom).coerceIn(0f, size.height)
+                    val vw = max(8f, vr - vl)
+                    val vh = max(8f, vb - vt)
+                    drawRect(
+                        color = Color(0x332AA1B7),
+                        topLeft = Offset(vl, vt),
+                        size = Size(vw, vh)
+                    )
+                    drawRect(
+                        color = Color(0xFF2AA1B7),
+                        topLeft = Offset(vl, vt),
+                        size = Size(vw, vh),
+                        style = Stroke(width = 2.2f)
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "Arrastra el cuadro azul",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = InkTextSecondary
+                )
+                TextButton(onClick = onFitAll) {
+                    Text("Encajar", style = MaterialTheme.typography.labelSmall, color = Mint)
                 }
             }
         }
@@ -515,6 +696,8 @@ internal fun MovablePenBox(
 private fun DragHandlePill(
     isVertical: Boolean,
     dragModifier: Modifier,
+    showFavorites: Boolean,
+    onToggleFavorites: () -> Unit,
     onRotate: () -> Unit,
     onCollapse: () -> Unit
 ) {
@@ -523,7 +706,6 @@ private fun DragHandlePill(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            // Drag grip area
             Box(
                 modifier = dragModifier
                     .fillMaxWidth()
@@ -544,13 +726,26 @@ private fun DragHandlePill(
                 }
             }
             Row(
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Box(
                     Modifier
-                        .size(26.dp)
-                        .clip(RoundedCornerShape(6.dp))
+                        .size(20.dp)
+                        .clip(RoundedCornerShape(5.dp))
+                        .clickable(onClick = onToggleFavorites),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "★",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (showFavorites) Mint else InkTextSecondary
+                    )
+                }
+                Box(
+                    Modifier
+                        .size(20.dp)
+                        .clip(RoundedCornerShape(5.dp))
                         .clickable(onClick = onRotate),
                     contentAlignment = Alignment.Center
                 ) {
@@ -558,8 +753,8 @@ private fun DragHandlePill(
                 }
                 Box(
                     Modifier
-                        .size(26.dp)
-                        .clip(RoundedCornerShape(6.dp))
+                        .size(20.dp)
+                        .clip(RoundedCornerShape(5.dp))
                         .clickable(onClick = onCollapse),
                     contentAlignment = Alignment.Center
                 ) {
@@ -575,7 +770,7 @@ private fun DragHandlePill(
             Box(
                 modifier = dragModifier
                     .width(22.dp)
-                    .height(48.dp)
+                    .height(50.dp)
                     .clip(RoundedCornerShape(8.dp))
                     .background(GraphiteBg),
                 contentAlignment = Alignment.Center
@@ -592,13 +787,26 @@ private fun DragHandlePill(
                 }
             }
             Column(
-                verticalArrangement = Arrangement.spacedBy(2.dp),
+                verticalArrangement = Arrangement.spacedBy(1.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Box(
                     Modifier
-                        .size(24.dp)
-                        .clip(RoundedCornerShape(6.dp))
+                        .size(18.dp)
+                        .clip(RoundedCornerShape(5.dp))
+                        .clickable(onClick = onToggleFavorites),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "★",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (showFavorites) Mint else InkTextSecondary
+                    )
+                }
+                Box(
+                    Modifier
+                        .size(18.dp)
+                        .clip(RoundedCornerShape(5.dp))
                         .clickable(onClick = onRotate),
                     contentAlignment = Alignment.Center
                 ) {
@@ -606,12 +814,12 @@ private fun DragHandlePill(
                 }
                 Box(
                     Modifier
-                        .size(24.dp)
-                        .clip(RoundedCornerShape(6.dp))
+                        .size(18.dp)
+                        .clip(RoundedCornerShape(5.dp))
                         .clickable(onClick = onCollapse),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text("−", style = MaterialTheme.typography.labelMedium, color = Mint)
+                    Text("−", style = MaterialTheme.typography.labelSmall, color = Mint)
                 }
             }
         }
@@ -625,7 +833,7 @@ private fun QuickWidthDots(
     currentWidthDp: Float,
     onSelectWidth: (Float) -> Unit
 ) {
-    if (activeTool == ToolMode.LASSO || activeTool == ToolMode.LASER) return
+    if (activeTool == ToolMode.LASSO || activeTool == ToolMode.LASER || activeTool == ToolMode.TEXT) return
     val presets = when (activeTool) {
         ToolMode.HIGHLIGHTER -> listOf(12f, 18f, 26f)
         ToolMode.TAPE -> listOf(16f, 22f, 30f)
@@ -720,7 +928,7 @@ private fun DockTile(
     ) {
         Box(
             Modifier
-                .size(width = 38.dp, height = 28.dp)
+                .size(width = 38.dp, height = 27.dp)
                 .background(if (active) ActiveTile else Color.Transparent, SheetActions),
             contentAlignment = Alignment.Center
         ) {
@@ -742,18 +950,21 @@ private fun glyphForTool(tool: ToolMode): EditorGlyph = when (tool) {
     ToolMode.DASHED -> EditorGlyph.Dashed
     ToolMode.HIGHLIGHTER -> EditorGlyph.Marker
     ToolMode.TAPE -> EditorGlyph.Tape
+    ToolMode.SHAPES -> EditorGlyph.Shapes
+    ToolMode.TEXT -> EditorGlyph.Text
     ToolMode.LASER -> EditorGlyph.Laser
     ToolMode.ERASER -> EditorGlyph.Eraser
     ToolMode.LASSO -> EditorGlyph.Lasso
 }
 
 private enum class EditorGlyph {
-    Pen, Ballpoint, Dashed, Marker, Tape, Laser, Eraser, Lasso, Shapes, Swatch, Undo, Redo, Reading, Focus, Menu
+    Pen, Ballpoint, Dashed, Marker, Tape, Shapes, Text, Laser, Eraser, Lasso,
+    Ruler, Layers, Minimap, Swatch, Undo, Redo, Reading, Focus, Menu
 }
 
 @Composable
 private fun DrawGlyph(glyph: EditorGlyph, tint: Color, swatch: Color = Color.Transparent) {
-    Canvas(Modifier.size(21.dp)) {
+    Canvas(Modifier.size(20.dp)) {
         scale(size.width / 24f, size.height / 24f, pivot = Offset.Zero) {
             val outline = Stroke(width = 1.7f, cap = StrokeCap.Round, join = StrokeJoin.Round)
             fun lines(points: List<Offset>, close: Boolean = false) {
@@ -788,6 +999,15 @@ private fun DrawGlyph(glyph: EditorGlyph, tint: Color, swatch: Color = Color.Tra
                     lines(listOf(Offset(8f, 7f), Offset(6f, 17f)))
                     lines(listOf(Offset(16f, 7f), Offset(14f, 17f)))
                 }
+                EditorGlyph.Shapes -> {
+                    drawRoundRect(tint, Offset(4f, 10f), Size(10f, 10f), CornerRadius(2f), style = outline)
+                    drawCircle(tint, radius = 4f, center = Offset(16f, 7.5f), style = outline)
+                }
+                EditorGlyph.Text -> {
+                    drawRoundRect(tint, Offset(3f, 4f), Size(18f, 16f), CornerRadius(3f), style = outline)
+                    lines(listOf(Offset(8f, 8f), Offset(16f, 8f)))
+                    lines(listOf(Offset(12f, 8f), Offset(12f, 16f)))
+                }
                 EditorGlyph.Laser -> {
                     drawCircle(tint, radius = 3.2f, center = Offset(12f, 12f))
                     lines(listOf(Offset(12f, 3f), Offset(12f, 6f)))
@@ -803,9 +1023,19 @@ private fun DrawGlyph(glyph: EditorGlyph, tint: Color, swatch: Color = Color.Tra
                     drawOval(tint, Offset(3f, 5f), Size(17f, 12f), style = outline)
                     lines(listOf(Offset(13f, 17f), Offset(11f, 21f), Offset(7f, 20f)))
                 }
-                EditorGlyph.Shapes -> {
-                    drawRoundRect(tint, Offset(4f, 10f), Size(10f, 10f), CornerRadius(2f), style = outline)
-                    drawCircle(tint, radius = 4f, center = Offset(16f, 7.5f), style = outline)
+                EditorGlyph.Ruler -> {
+                    drawRoundRect(tint, Offset(3f, 7f), Size(18f, 10f), CornerRadius(2f), style = outline)
+                    lines(listOf(Offset(7f, 7f), Offset(7f, 11f)))
+                    lines(listOf(Offset(12f, 7f), Offset(12f, 13f)))
+                    lines(listOf(Offset(17f, 7f), Offset(17f, 11f)))
+                }
+                EditorGlyph.Layers -> {
+                    lines(listOf(Offset(12f, 4f), Offset(20f, 9f), Offset(12f, 14f), Offset(4f, 9f)), close = true)
+                    lines(listOf(Offset(4f, 14f), Offset(12f, 19f), Offset(20f, 14f)))
+                }
+                EditorGlyph.Minimap -> {
+                    drawRoundRect(tint, Offset(3f, 4f), Size(18f, 16f), CornerRadius(2f), style = outline)
+                    drawRoundRect(tint, Offset(11f, 10f), Size(7f, 6f), CornerRadius(1f), style = outline)
                 }
                 EditorGlyph.Swatch -> {
                     drawCircle(swatch, 6.5f, Offset(12f, 12f))

@@ -9,9 +9,11 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PointF
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.text.TextPaint
 import android.util.Log
 import android.util.TypedValue
 import android.view.MotionEvent
@@ -36,31 +38,37 @@ import androidx.ink.strokes.StrokeInput
 import androidx.input.motionprediction.MotionEventPredictor
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.ceil
+import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
 import kotlin.math.sqrt
 
-/** Keeps high-frequency stylus input, world-normalized strokes, zoom/pan, shapes, tape, laser, and lasso outside Compose state. */
+/** High-frequency stylus canvas with world-normalized strokes, 2D/3D shapes, text boxes, layers, ruler, tape, laser, and lasso. */
 class PenSheet(
     context: Context,
     private val onStateChanged: (canUndo: Boolean, canRedo: Boolean, hasSelection: Boolean) -> Unit,
-    private val onTelemetryChanged: (PenTelemetry) -> Unit = {}
+    private val onTelemetryChanged: (PenTelemetry) -> Unit = {},
+    private val onRequestTextBoxEditor: (existing: TextBoxItem?, worldX: Float, worldY: Float) -> Unit = { _, _, _ -> }
 ) : FrameLayout(context) {
 
     companion object {
         private const val TAG = "PenSheet"
-        private const val LASER_FADE_MS = 1500L
     }
 
     sealed interface CanvasItem {
         val id: Long
+        val layerId: Int
         val worldBounds: RectF
         val isHighlighter: Boolean
         val isTape: Boolean
         fun translated(dx: Float, dy: Float, newId: Long = id): CanvasItem
+        fun scaled(anchorX: Float, anchorY: Float, factor: Float, newId: Long = id): CanvasItem
         fun recolored(newColor: Int): CanvasItem
+        fun withLayer(newLayerId: Int): CanvasItem
     }
 
     data class DebugRawStroke(
@@ -72,6 +80,7 @@ class PenSheet(
 
     data class InkItem(
         override val id: Long,
+        override val layerId: Int,
         val data: StrokeData,
         val stroke: Stroke,
         override val worldBounds: RectF,
@@ -86,9 +95,25 @@ class PenSheet(
             val movedBounds = computeStrokeWorldBounds(movedStroke, movedData)
             return InkItem(
                 id = newId,
+                layerId = layerId,
                 data = movedData,
                 stroke = movedStroke,
                 worldBounds = movedBounds,
+                isHighlighter = isHighlighter,
+                debugRaw = null
+            )
+        }
+
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float, newId: Long): InkItem {
+            val scaledData = data.scaled(anchorX, anchorY, factor)
+            val scaledStroke = buildStrokeFromData(scaledData)
+            val scaledBounds = computeStrokeWorldBounds(scaledStroke, scaledData)
+            return InkItem(
+                id = newId,
+                layerId = layerId,
+                data = scaledData,
+                stroke = scaledStroke,
+                worldBounds = scaledBounds,
                 isHighlighter = isHighlighter,
                 debugRaw = null
             )
@@ -100,14 +125,18 @@ class PenSheet(
             return copy(data = newData, stroke = newStroke, debugRaw = null)
         }
 
+        override fun withLayer(newLayerId: Int): InkItem = copy(layerId = newLayerId)
+
         override fun equals(other: Any?): Boolean = (other is InkItem) && other.id == id
         override fun hashCode(): Int = id.hashCode()
     }
 
     data class ShapeItem(
         override val id: Long,
+        override val layerId: Int,
         val shape: RecognizedShape,
         val color: Int,
+        val fillColor: Int = Color.TRANSPARENT,
         val strokeWidthWorld: Float,
         override val worldBounds: RectF,
         override val isHighlighter: Boolean
@@ -116,19 +145,72 @@ class PenSheet(
 
         override fun translated(dx: Float, dy: Float, newId: Long): ShapeItem {
             val movedShape = shape.translated(dx, dy)
-            return ShapeItem(
+            return copy(
                 id = newId,
                 shape = movedShape,
-                color = color,
-                strokeWidthWorld = strokeWidthWorld,
-                worldBounds = movedShape.computeWorldBounds(strokeWidthWorld),
-                isHighlighter = isHighlighter
+                worldBounds = movedShape.computeWorldBounds(strokeWidthWorld)
+            )
+        }
+
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float, newId: Long): ShapeItem {
+            val scaledShape = shape.scaled(anchorX, anchorY, factor)
+            val newWidth = (strokeWidthWorld * factor).coerceIn(0.5f, 120f)
+            return copy(
+                id = newId,
+                shape = scaledShape,
+                strokeWidthWorld = newWidth,
+                worldBounds = scaledShape.computeWorldBounds(newWidth)
             )
         }
 
         override fun recolored(newColor: Int): ShapeItem = copy(color = newColor)
+        override fun withLayer(newLayerId: Int): ShapeItem = copy(layerId = newLayerId)
 
         override fun equals(other: Any?): Boolean = (other is ShapeItem) && other.id == id
+        override fun hashCode(): Int = id.hashCode()
+    }
+
+    data class TextBoxItem(
+        override val id: Long,
+        override val layerId: Int,
+        val x: Float,
+        val y: Float,
+        val text: String,
+        val color: Int,
+        val bgColor: Int = Color.TRANSPARENT,
+        val fontSizeWorld: Float,
+        val isBold: Boolean = false,
+        val isItalic: Boolean = false,
+        val isUnderline: Boolean = false,
+        override val worldBounds: RectF
+    ) : CanvasItem {
+        override val isHighlighter: Boolean get() = false
+        override val isTape: Boolean get() = false
+
+        override fun translated(dx: Float, dy: Float, newId: Long): TextBoxItem {
+            val movedBounds = RectF(worldBounds).apply { offset(dx, dy) }
+            return copy(id = newId, x = x + dx, y = y + dy, worldBounds = movedBounds)
+        }
+
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float, newId: Long): TextBoxItem {
+            val nx = anchorX + (x - anchorX) * factor
+            val ny = anchorY + (y - anchorY) * factor
+            val nSize = (fontSizeWorld * factor).coerceIn(8f, 180f)
+            val bw = worldBounds.width() * factor
+            val bh = worldBounds.height() * factor
+            return copy(
+                id = newId,
+                x = nx,
+                y = ny,
+                fontSizeWorld = nSize,
+                worldBounds = RectF(nx, ny, nx + bw, ny + bh)
+            )
+        }
+
+        override fun recolored(newColor: Int): TextBoxItem = copy(color = newColor)
+        override fun withLayer(newLayerId: Int): TextBoxItem = copy(layerId = newLayerId)
+
+        override fun equals(other: Any?): Boolean = (other is TextBoxItem) && other.id == id
         override fun hashCode(): Int = id.hashCode()
     }
 
@@ -155,19 +237,28 @@ class PenSheet(
     private val revealedTapeIds = mutableSetOf<Long>()
     private val waitingForInk = mutableMapOf<InProgressStrokeId, PendingStrokeMeta>()
 
+    // Layers (Section 19 · 图层)
+    val layers = mutableListOf(NoteLayer(id = 1, name = "Capa 1"))
+    var activeLayerId: Int = 1
+
     // Laser pointer trails (ephemeral)
     private var activeLaserTrail: LaserTrail? = null
     private val laserTrails = mutableListOf<LaserTrail>()
+    var laserFadeDurationMs: Long = 1500L
+    var laserColor: Int = 0xFFFF1744.toInt()
 
     private data class PendingStrokeMeta(
         val scale: Float,
         val panX: Float,
         val panY: Float,
+        val layerId: Int,
         val brushType: BrushType,
         val color: Int,
+        val fillColor: Int,
         val sizeWorld: Float,
         val epsilonWorld: Float,
         val isHighlighter: Boolean,
+        val pressureSensitivity: Float,
         val snappedShape: RecognizedShape? = null
     )
 
@@ -183,6 +274,13 @@ class PenSheet(
     private var x = 0f
     private var y = 0f
     private var lastEraseWorld: PointF? = null
+
+    // Direct Shape drag state (Section 09 · 图形笔)
+    private var directShapeStartWorld: PointF? = null
+    private var directShapePreview: RecognizedShape? = null
+
+    // Lasso-erase loop state (Section 09 · 圈选擦除)
+    private val eraserLassoWorld = mutableListOf<PointF>()
 
     // Diagnostics counters
     private var fingerContacts = 0
@@ -200,10 +298,19 @@ class PenSheet(
     private var holdSnappedShape: RecognizedShape? = null
     private val holdRunnable = Runnable { trySnapHoldShape() }
 
+    // Single-finger double-tap & long-press tracking (Part 4 · 手势操作)
+    private var lastSingleFingerTapMs = 0L
+    private var lastSingleFingerTapX = 0f
+    private var lastSingleFingerTapY = 0f
+    private val longPressRunnable = Runnable { handleSingleFingerLongPress() }
+
     // Zoom & Pan (2-finger) & Multi-finger Tap Undo/Redo gestures
-    private var viewScale = 1f
-    private var panX = 0f
-    private var panY = 0f
+    var viewScale = 1f
+        private set
+    var panX = 0f
+        private set
+    var panY = 0f
+        private set
     private var isTwoFingerGesturing = false
     private var lastMidX = 0f
     private var lastMidY = 0f
@@ -233,12 +340,38 @@ class PenSheet(
         }
     )
 
-    // Lasso selection & temporary drag state (baked on finishPen)
+    // Lasso selection, temporary drag & corner resize state
     private val lassoPathWorld = mutableListOf<PointF>()
     private var selectionDragLastWorld: PointF? = null
     private var isDraggingSelection = false
+    private var isScalingSelection = false
+    private var scaleAnchorX = 0f
+    private var scaleAnchorY = 0f
+    private var scaleInitialDist = 1f
+    private var activeScaleFactor = 1f
     private var dragDx = 0f
     private var dragDy = 0f
+
+    // Virtual Ruler state (Guides and Shapes)
+    var rulerEnabled: Boolean = false
+        set(value) {
+            field = value
+            if (value && rulerWorldX == 0f && rulerWorldY == 0f && width > 0) {
+                rulerWorldX = screenToWorldX(width * 0.5f)
+                rulerWorldY = screenToWorldY(height * 0.5f)
+            }
+            dryInk.invalidate()
+        }
+    var rulerWorldX: Float = 0f
+    var rulerWorldY: Float = 0f
+    var rulerAngleDeg: Float = 0f
+        set(value) {
+            field = ((value % 360f) + 360f) % 360f
+            dryInk.invalidate()
+        }
+    private var isDraggingRuler = false
+    private var isRotatingRuler = false
+    private var rulerDragLastWorld: PointF? = null
 
     // Configurable editor properties
     var toolMode: ToolMode = ToolMode.PEN
@@ -249,6 +382,19 @@ class PenSheet(
             }
             diagnostics.invalidate()
         }
+
+    var eraserMode: EraserMode = EraserMode.STROKE
+    var eraseOnlyHighlighter: Boolean = false
+    var eraseOnlyTape: Boolean = false
+
+    var lassoMode: LassoMode = LassoMode.FREEHAND
+    var lassoSelectInk: Boolean = true
+    var lassoSelectShapes: Boolean = true
+    var lassoSelectText: Boolean = true
+
+    var directShapeKind: DirectShapeKind = DirectShapeKind.AUTO
+    var shapeFillEnabled: Boolean = false
+    var shapeFillOpacity: Float = 0.25f
 
     var inkColor: Int = PaperStyle.LIGHT.defaultInkColor
         set(value) {
@@ -272,6 +418,8 @@ class PenSheet(
     var highlighterWidthDp: Float = 18f
     var tapeWidthDp: Float = 22f
     var eraserRadiusDp: Float = 12f
+    var pressureSensitivity: Float = 1.0f
+    var ballpointOpacity: Float = 1.0f
     var autoShapeEnabled: Boolean = false
 
     // Advanced Notein-inspired settings
@@ -285,6 +433,7 @@ class PenSheet(
     var allowFingerDrawing: Boolean = false
     var adaptiveStrokeWidth: Boolean = true
     var gestureTapUndoRedo: Boolean = true
+    var doubleTapFitPage: Boolean = true
     var pressureEraserEnabled: Boolean = false
     var pressureEraserThreshold: Float = 0.78f
     var revealAllTapes: Boolean = false
@@ -306,13 +455,25 @@ class PenSheet(
             dryInk.invalidate()
         }
 
+    // Live template customization (Section 05 & 22)
+    var templateSpacingDp: Float = 22f
+        set(value) {
+            field = value.coerceIn(12f, 52f)
+            dryInk.invalidate()
+        }
+
+    var templateOpacity: Float = 1.0f
+        set(value) {
+            field = value.coerceIn(0.15f, 1.0f)
+            dryInk.invalidate()
+        }
+
     var showDiagnostics: Boolean = false
         set(value) {
             field = value
             diagnostics.invalidate()
         }
 
-    /** Debug mode for Step A exit test: draws raw screen-space stroke in red and normalized world stroke in semi-transparent blue. */
     var debugCompareNormalized: Boolean = false
         set(value) {
             val enabled = isDebugBuild && value
@@ -332,7 +493,15 @@ class PenSheet(
         TypedValue.COMPLEX_UNIT_SP, 12f, resources.displayMetrics
     )
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
     private val shapePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val dashedShapePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
@@ -347,11 +516,18 @@ class PenSheet(
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
     }
+    private val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG)
 
     val isWriting: Boolean get() = activePointer != -1 || waitingForInk.isNotEmpty()
 
     private fun screenToWorldX(sx: Float): Float = (sx - panX) / viewScale
     private fun screenToWorldY(sy: Float): Float = (sy - panY) / viewScale
+
+    private fun isLayerVisible(layerId: Int): Boolean =
+        layers.firstOrNull { it.id == layerId }?.visible ?: true
+
+    private fun isLayerLocked(layerId: Int): Boolean =
+        layers.firstOrNull { it.id == layerId }?.locked ?: false
 
     private val dryInk = object : View(context) {
         private val visibleWorldRect = RectF()
@@ -375,43 +551,66 @@ class PenSheet(
 
             // Pass 1: Highlighter strokes & shapes behind opaque ink
             for (item in items) {
-                if (item.id !in erasedIds && item.isHighlighter && !item.isTape &&
+                if (item.id !in erasedIds && isLayerVisible(item.layerId) &&
+                    item.isHighlighter && !item.isTape &&
                     isItemVisible(item, visibleWorldRect, itemCheckRect)
                 ) {
                     drawCanvasItem(canvas, item)
                 }
             }
-            // Pass 2: Opaque pen strokes & geometric shapes
+            // Pass 2: Opaque pen strokes, geometric shapes, and text boxes
             for (item in items) {
-                if (item.id !in erasedIds && !item.isHighlighter && !item.isTape &&
+                if (item.id !in erasedIds && isLayerVisible(item.layerId) &&
+                    !item.isHighlighter && !item.isTape &&
                     isItemVisible(item, visibleWorldRect, itemCheckRect)
                 ) {
                     drawCanvasItem(canvas, item)
                 }
             }
-            // Pass 3: Study Tapes (drawn OVER opaque ink to mask formulas/answers; semi-transparent when revealed)
+            // Pass 3: Study Tapes (drawn OVER opaque ink to mask formulas/answers)
             for (item in items) {
-                if (item.id !in erasedIds && item.isTape &&
+                if (item.id !in erasedIds && isLayerVisible(item.layerId) &&
+                    item.isTape &&
                     isItemVisible(item, visibleWorldRect, itemCheckRect)
                 ) {
                     drawCanvasItem(canvas, item)
                 }
             }
 
-            // Active lasso loop
+            // Active lasso loop or rectangle
             if (toolMode == ToolMode.LASSO && lassoPathWorld.size > 1) {
                 lassoPaint.strokeWidth = 2f * density / viewScale
                 lassoPaint.color = Color.rgb(42, 161, 183)
-                val path = Path().apply {
-                    moveTo(lassoPathWorld[0].x, lassoPathWorld[0].y)
-                    for (i in 1 until lassoPathWorld.size) {
-                        lineTo(lassoPathWorld[i].x, lassoPathWorld[i].y)
+                if (lassoMode == LassoMode.RECTANGLE) {
+                    val f = lassoPathWorld.first()
+                    val l = lassoPathWorld.last()
+                    canvas.drawRect(min(f.x, l.x), min(f.y, l.y), max(f.x, l.x), max(f.y, l.y), lassoPaint)
+                } else {
+                    val path = Path().apply {
+                        moveTo(lassoPathWorld[0].x, lassoPathWorld[0].y)
+                        for (i in 1 until lassoPathWorld.size) {
+                            lineTo(lassoPathWorld[i].x, lassoPathWorld[i].y)
+                        }
                     }
+                    canvas.drawPath(path, lassoPaint)
+                }
+            }
+
+            // Active lasso-eraser loop
+            if (erasing && eraserMode == EraserMode.LASSO_ERASE && eraserLassoWorld.size > 1) {
+                lassoPaint.strokeWidth = 2f * density / viewScale
+                lassoPaint.color = Color.rgb(224, 108, 117)
+                val path = Path().apply {
+                    moveTo(eraserLassoWorld[0].x, eraserLassoWorld[0].y)
+                    for (i in 1 until eraserLassoWorld.size) {
+                        lineTo(eraserLassoWorld[i].x, eraserLassoWorld[i].y)
+                    }
+                    close()
                 }
                 canvas.drawPath(path, lassoPaint)
             }
 
-            // Selection bounding box (includes temporary dragDx/dragDy while dragging)
+            // Selection bounding box + bottom-right resize handle
             if (selectedIds.isNotEmpty()) {
                 val bounds = computeSelectionBounds()
                 if (!bounds.isEmpty) {
@@ -420,14 +619,28 @@ class PenSheet(
                     lassoPaint.strokeWidth = 2f * density / viewScale
                     lassoPaint.color = Color.rgb(42, 161, 183)
                     canvas.drawRoundRect(bounds, 8f / viewScale, 8f / viewScale, lassoPaint)
+
+                    // Corner resize handle
+                    val handleR = 7f * density / viewScale
+                    paint.style = Paint.Style.FILL
+                    paint.color = Color.rgb(42, 161, 183)
+                    canvas.drawCircle(bounds.right, bounds.bottom, handleR, paint)
                 }
             }
 
-            // Live Hold-to-Shape preview while stylus is still down
-            holdSnappedShape?.let { preview ->
-                shapePaint.color = Color.argb(180, 42, 161, 183)
+            // Live Hold-to-Shape or Direct Shape preview
+            val previewShape = directShapePreview ?: holdSnappedShape
+            if (previewShape != null) {
+                val pColor = if (directShapePreview != null) inkColor else Color.argb(190, 42, 161, 183)
+                shapePaint.color = pColor
                 shapePaint.strokeWidth = (penWidthDp * density) / viewScale
-                drawShape(canvas, preview)
+                val pFill = if (shapeFillEnabled) applyAlpha(inkColor, (shapeFillOpacity * 255).toInt()) else Color.TRANSPARENT
+                drawShape(canvas, previewShape, pFill, shapePaint.strokeWidth)
+            }
+
+            // Virtual Ruler overlay
+            if (rulerEnabled) {
+                drawVirtualRuler(canvas)
             }
 
             // Ephemeral Laser pointer trails
@@ -437,21 +650,63 @@ class PenSheet(
         }
     }
 
+    private fun drawVirtualRuler(canvas: Canvas) {
+        val len = 340f * density / viewScale
+        val thick = 44f * density / viewScale
+        canvas.save()
+        canvas.translate(rulerWorldX, rulerWorldY)
+        canvas.rotate(rulerAngleDeg)
+
+        val rect = RectF(-len * 0.5f, 0f, len * 0.5f, thick)
+        fillPaint.color = Color.argb(180, 29, 33, 40)
+        canvas.drawRoundRect(rect, 8f / viewScale, 8f / viewScale, fillPaint)
+
+        shapePaint.color = Color.rgb(145, 225, 213)
+        shapePaint.strokeWidth = 2f * density / viewScale
+        canvas.drawRoundRect(rect, 8f / viewScale, 8f / viewScale, shapePaint)
+
+        // Graduations along the top ruling edge (y = 0)
+        val step = 10f * density / viewScale
+        var gx = -len * 0.45f
+        var tickIdx = 0
+        shapePaint.strokeWidth = 1f * density / viewScale
+        while (gx <= len * 0.45f) {
+            val tickH = if (tickIdx % 5 == 0) thick * 0.34f else thick * 0.18f
+            canvas.drawLine(gx, 0f, gx, tickH, shapePaint)
+            gx += step
+            tickIdx++
+        }
+
+        // Degree badge in center and rotation handle at right end
+        paint.style = Paint.Style.FILL
+        paint.color = Color.rgb(145, 225, 213)
+        paint.textSize = 12f * density / viewScale
+        canvas.drawText(
+            String.format(Locale.getDefault(), "%.0f°", rulerAngleDeg),
+            -14f * density / viewScale,
+            thick * 0.68f,
+            paint
+        )
+        canvas.drawCircle(len * 0.42f, thick * 0.5f, 8f * density / viewScale, paint)
+        canvas.restore()
+    }
+
     private fun drawLaserTrails(canvas: Canvas) {
         val now = SystemClock.uptimeMillis()
         var needsNextFrame = false
+        val fadeMs = laserFadeDurationMs.coerceAtLeast(300L)
         val iterator = laserTrails.iterator()
         while (iterator.hasNext()) {
             val trail = iterator.next()
             val age = now - trail.lastPointMs
-            if (age >= LASER_FADE_MS && trail !== activeLaserTrail) {
+            if (age >= fadeMs && trail !== activeLaserTrail) {
                 iterator.remove()
                 continue
             }
             val alphaFactor = if (trail === activeLaserTrail) {
                 1f
             } else {
-                (1f - age.toFloat() / LASER_FADE_MS).coerceIn(0f, 1f)
+                (1f - age.toFloat() / fadeMs).coerceIn(0f, 1f)
             }
             if (trail.points.size >= 2) {
                 val path = Path().apply {
@@ -460,9 +715,8 @@ class PenSheet(
                         lineTo(trail.points[i].x, trail.points[i].y)
                     }
                 }
-                // Outer neon halo
                 laserPaint.color = Color.argb(
-                    (110 * alphaFactor).toInt(),
+                    (115 * alphaFactor).toInt(),
                     Color.red(trail.color),
                     Color.green(trail.color),
                     Color.blue(trail.color)
@@ -470,8 +724,7 @@ class PenSheet(
                 laserPaint.strokeWidth = (12f * density) / viewScale
                 canvas.drawPath(path, laserPaint)
 
-                // Inner bright core
-                laserPaint.color = Color.argb((245 * alphaFactor).toInt(), 255, 240, 245)
+                laserPaint.color = Color.argb((245 * alphaFactor).toInt(), 255, 245, 248)
                 laserPaint.strokeWidth = (3.5f * density) / viewScale
                 canvas.drawPath(path, laserPaint)
                 needsNextFrame = true
@@ -484,8 +737,12 @@ class PenSheet(
 
     private fun isItemVisible(item: CanvasItem, visibleWorld: RectF, scratch: RectF): Boolean {
         scratch.set(item.worldBounds)
-        if (isDraggingSelection && item.id in selectedIds) {
-            scratch.offset(dragDx, dragDy)
+        if (item.id in selectedIds) {
+            if (isDraggingSelection) {
+                scratch.offset(dragDx, dragDy)
+            } else if (isScalingSelection) {
+                return true
+            }
         }
         return RectF.intersects(visibleWorld, scratch)
     }
@@ -499,10 +756,16 @@ class PenSheet(
         val worldBottom = (height - panY) / viewScale
 
         paint.style = Paint.Style.STROKE
-        paint.color = paperStyle.lineColor
-        paint.strokeWidth = (density * 0.7f) / viewScale
+        val baseColor = paperStyle.lineColor
+        paint.color = Color.argb(
+            (templateOpacity * 255).toInt().coerceIn(25, 255),
+            Color.red(baseColor),
+            Color.green(baseColor),
+            Color.blue(baseColor)
+        )
+        paint.strokeWidth = (density * 0.75f) / viewScale
 
-        val spacing = 22f * density
+        val spacing = templateSpacingDp * density
         val startX = (kotlin.math.floor((worldLeft / spacing).toDouble()) * spacing).toFloat()
         val startY = (kotlin.math.floor((worldTop / spacing).toDouble()) * spacing).toFloat()
 
@@ -521,7 +784,7 @@ class PenSheet(
                 }
             }
             PaperTemplate.RULED -> {
-                val lineSpacing = 28f * density
+                val lineSpacing = spacing * 1.25f
                 val rStartY = (kotlin.math.floor((worldTop / lineSpacing).toDouble()) * lineSpacing).toFloat()
                 var gy = rStartY
                 while (gy <= worldBottom) {
@@ -531,7 +794,7 @@ class PenSheet(
             }
             PaperTemplate.DOTTED -> {
                 paint.style = Paint.Style.FILL
-                val dotR = (1.3f * density) / viewScale
+                val dotR = (1.35f * density) / viewScale
                 var gx = startX
                 while (gx <= worldRight) {
                     var gy = startY
@@ -543,7 +806,7 @@ class PenSheet(
                 }
             }
             PaperTemplate.ISOMETRIC -> {
-                val step = 28f * density
+                val step = spacing * 1.25f
                 val dx = step
                 val dy = step * sqrt(3f) * 0.5f
                 val span = max(worldRight - worldLeft, worldBottom - worldTop) + step * 4
@@ -563,14 +826,35 @@ class PenSheet(
                     gx += dx
                 }
             }
+            PaperTemplate.CORNELL -> {
+                val lineSpacing = spacing * 1.25f
+                val rStartY = (kotlin.math.floor((worldTop / lineSpacing).toDouble()) * lineSpacing).toFloat()
+                var gy = rStartY
+                while (gy <= worldBottom) {
+                    canvas.drawLine(worldLeft, gy, worldRight, gy, paint)
+                    gy += lineSpacing
+                }
+                // Cornell cue margin line & top header line
+                paint.strokeWidth = (density * 1.5f) / viewScale
+                val marginX = 95f * density
+                val headerY = 64f * density
+                canvas.drawLine(marginX, worldTop, marginX, worldBottom, paint)
+                canvas.drawLine(worldLeft, headerY, worldRight, headerY, paint)
+            }
         }
     }
 
     private fun drawCanvasItem(canvas: Canvas, item: CanvasItem) {
-        val applyTempDrag = isDraggingSelection && item.id in selectedIds
-        if (applyTempDrag) {
+        val isSelected = item.id in selectedIds
+        val applyTempDrag = isDraggingSelection && isSelected
+        val applyTempScale = isScalingSelection && isSelected
+        if (applyTempDrag || applyTempScale) {
             canvas.save()
-            canvas.translate(dragDx, dragDy)
+            if (applyTempDrag) {
+                canvas.translate(dragDx, dragDy)
+            } else if (applyTempScale) {
+                canvas.scale(activeScaleFactor, activeScaleFactor, scaleAnchorX, scaleAnchorY)
+            }
         }
 
         when (item) {
@@ -608,47 +892,97 @@ class PenSheet(
             is ShapeItem -> {
                 shapePaint.color = item.color
                 shapePaint.strokeWidth = item.strokeWidthWorld
-                drawShape(canvas, item.shape)
+                drawShape(canvas, item.shape, item.fillColor, item.strokeWidthWorld)
+            }
+            is TextBoxItem -> {
+                drawTextBoxItem(canvas, item)
             }
         }
 
-        if (applyTempDrag) {
+        if (applyTempDrag || applyTempScale) {
             canvas.restore()
         }
     }
 
-    private fun drawShape(canvas: Canvas, shape: RecognizedShape) {
+    private fun drawTextBoxItem(canvas: Canvas, item: TextBoxItem) {
+        if (Color.alpha(item.bgColor) > 0) {
+            fillPaint.color = item.bgColor
+            canvas.drawRoundRect(item.worldBounds, 6f, 6f, fillPaint)
+        }
+        textPaint.color = item.color
+        textPaint.textSize = item.fontSizeWorld
+        val style = when {
+            item.isBold && item.isItalic -> Typeface.BOLD_ITALIC
+            item.isBold -> Typeface.BOLD
+            item.isItalic -> Typeface.ITALIC
+            else -> Typeface.NORMAL
+        }
+        textPaint.typeface = Typeface.create(Typeface.DEFAULT, style)
+        textPaint.isUnderlineText = item.isUnderline
+
+        val lines = item.text.split('\n')
+        val lineHeight = item.fontSizeWorld * 1.3f
+        var baselineY = item.y + item.fontSizeWorld
+        val padX = 6f
+        for (line in lines) {
+            canvas.drawText(line, item.x + padX, baselineY, textPaint)
+            baselineY += lineHeight
+        }
+    }
+
+    private fun drawShape(
+        canvas: Canvas,
+        shape: RecognizedShape,
+        fillColor: Int = Color.TRANSPARENT,
+        strokeWidth: Float = shapePaint.strokeWidth
+    ) {
+        val hasFill = Color.alpha(fillColor) > 0
+        if (hasFill) {
+            fillPaint.color = fillColor
+        }
+        dashedShapePaint.color = shapePaint.color
+        dashedShapePaint.strokeWidth = strokeWidth
+        val dashUnit = max(6f, strokeWidth * 2.2f)
+        dashedShapePaint.pathEffect = DashPathEffect(floatArrayOf(dashUnit, dashUnit), 0f)
+
         when (shape) {
             is RecognizedShape.Line -> {
-                canvas.drawLine(
-                    shape.start.x, shape.start.y,
-                    shape.end.x, shape.end.y,
-                    shapePaint
-                )
+                canvas.drawLine(shape.start.x, shape.start.y, shape.end.x, shape.end.y, shapePaint)
+            }
+            is RecognizedShape.WavyLine -> {
+                val pts = shape.samplePoints(4f)
+                if (pts.size >= 2) {
+                    val path = Path().apply {
+                        moveTo(pts[0].x, pts[0].y)
+                        for (i in 1 until pts.size) lineTo(pts[i].x, pts[i].y)
+                    }
+                    canvas.drawPath(path, shapePaint)
+                }
             }
             is RecognizedShape.Arrow -> {
-                canvas.drawLine(
-                    shape.start.x, shape.start.y,
-                    shape.end.x, shape.end.y,
-                    shapePaint
-                )
-                canvas.drawLine(
-                    shape.end.x, shape.end.y,
-                    shape.wingLeft.x, shape.wingLeft.y,
-                    shapePaint
-                )
-                canvas.drawLine(
-                    shape.end.x, shape.end.y,
-                    shape.wingRight.x, shape.wingRight.y,
-                    shapePaint
-                )
+                canvas.drawLine(shape.start.x, shape.start.y, shape.end.x, shape.end.y, shapePaint)
+                canvas.drawLine(shape.end.x, shape.end.y, shape.wingLeft.x, shape.wingLeft.y, shapePaint)
+                canvas.drawLine(shape.end.x, shape.end.y, shape.wingRight.x, shape.wingRight.y, shapePaint)
+            }
+            is RecognizedShape.CoordinateAxes -> {
+                val ox = shape.originX
+                val oy = shape.originY
+                val head = max(10f, min(shape.right - shape.left, shape.bottom - shape.top) * 0.08f)
+                // X axis (left to right with arrow at right)
+                canvas.drawLine(shape.left, oy, shape.right, oy, shapePaint)
+                canvas.drawLine(shape.right, oy, shape.right - head, oy - head * 0.6f, shapePaint)
+                canvas.drawLine(shape.right, oy, shape.right - head, oy + head * 0.6f, shapePaint)
+                // Y axis (bottom to top with arrow at top)
+                canvas.drawLine(ox, shape.bottom, ox, shape.top, shapePaint)
+                canvas.drawLine(ox, shape.top, ox - head * 0.6f, shape.top + head, shapePaint)
+                canvas.drawLine(ox, shape.top, ox + head * 0.6f, shape.top + head, shapePaint)
+            }
+            is RecognizedShape.Shape3D -> {
+                draw3DShape(canvas, shape, hasFill)
             }
             is RecognizedShape.Rectangle -> {
-                canvas.drawRect(
-                    shape.left, shape.top,
-                    shape.right, shape.bottom,
-                    shapePaint
-                )
+                if (hasFill) canvas.drawRect(shape.left, shape.top, shape.right, shape.bottom, fillPaint)
+                canvas.drawRect(shape.left, shape.top, shape.right, shape.bottom, shapePaint)
             }
             is RecognizedShape.Triangle -> {
                 val path = Path().apply {
@@ -657,14 +991,20 @@ class PenSheet(
                     lineTo(shape.c.x, shape.c.y)
                     close()
                 }
+                if (hasFill) canvas.drawPath(path, fillPaint)
                 canvas.drawPath(path, shapePaint)
             }
             is RecognizedShape.Ellipse -> {
+                if (hasFill) {
+                    canvas.drawOval(
+                        shape.cx - shape.rx, shape.cy - shape.ry,
+                        shape.cx + shape.rx, shape.cy + shape.ry,
+                        fillPaint
+                    )
+                }
                 canvas.drawOval(
-                    shape.cx - shape.rx,
-                    shape.cy - shape.ry,
-                    shape.cx + shape.rx,
-                    shape.cy + shape.ry,
+                    shape.cx - shape.rx, shape.cy - shape.ry,
+                    shape.cx + shape.rx, shape.cy + shape.ry,
                     shapePaint
                 )
             }
@@ -678,6 +1018,7 @@ class PenSheet(
                         }
                         close()
                     }
+                    if (hasFill) canvas.drawPath(path, fillPaint)
                     canvas.drawPath(path, shapePaint)
                 }
             }
@@ -699,6 +1040,99 @@ class PenSheet(
                     quadTo(shape.control.x, shape.control.y, shape.end.x, shape.end.y)
                 }
                 canvas.drawPath(path, shapePaint)
+            }
+        }
+    }
+
+    private fun draw3DShape(canvas: Canvas, shape: RecognizedShape.Shape3D, hasFill: Boolean) {
+        val l = shape.left
+        val t = shape.top
+        val r = shape.right
+        val b = shape.bottom
+        val w = r - l
+        val h = b - t
+        val cx = (l + r) * 0.5f
+        val cy = (t + b) * 0.5f
+
+        when (shape.kind) {
+            DirectShapeKind.CUBE -> {
+                val dx = w * 0.28f
+                val dy = h * 0.28f
+                val fl = l
+                val ft = t + dy
+                val fr = r - dx
+                val fb = b
+                val bl = l + dx
+                val bt = t
+                val br = r
+                val bb = b - dy
+
+                if (hasFill) {
+                    canvas.drawRect(fl, ft, fr, fb, fillPaint)
+                }
+                // Front face (solid)
+                canvas.drawRect(fl, ft, fr, fb, shapePaint)
+                // Top and Right visible back edges (solid)
+                canvas.drawLine(fl, ft, bl, bt, shapePaint)
+                canvas.drawLine(fr, ft, br, bt, shapePaint)
+                canvas.drawLine(fr, fb, br, bb, shapePaint)
+                canvas.drawLine(bl, bt, br, bt, shapePaint)
+                canvas.drawLine(br, bt, br, bb, shapePaint)
+                // Hidden interior back edges (dashed)
+                canvas.drawLine(fl, fb, bl, bb, dashedShapePaint)
+                canvas.drawLine(bl, bt, bl, bb, dashedShapePaint)
+                canvas.drawLine(bl, bb, br, bb, dashedShapePaint)
+            }
+            DirectShapeKind.CYLINDER -> {
+                val ry = min(h * 0.18f, w * 0.25f)
+                val topOval = RectF(l, t, r, t + 2f * ry)
+                val botOval = RectF(l, b - 2f * ry, r, b)
+                if (hasFill) {
+                    canvas.drawRect(l, t + ry, r, b - ry, fillPaint)
+                    canvas.drawOval(topOval, fillPaint)
+                    canvas.drawOval(botOval, fillPaint)
+                }
+                canvas.drawOval(topOval, shapePaint)
+                canvas.drawLine(l, t + ry, l, b - ry, shapePaint)
+                canvas.drawLine(r, t + ry, r, b - ry, shapePaint)
+                canvas.drawArc(botOval, 0f, 180f, false, shapePaint)
+                canvas.drawArc(botOval, 180f, 180f, false, dashedShapePaint)
+            }
+            DirectShapeKind.CONE -> {
+                val ry = min(h * 0.18f, w * 0.25f)
+                val botOval = RectF(l, b - 2f * ry, r, b)
+                val apexX = cx
+                val apexY = t
+                val baseCy = b - ry
+                if (hasFill) {
+                    val tri = Path().apply {
+                        moveTo(apexX, apexY)
+                        lineTo(r, baseCy)
+                        lineTo(l, baseCy)
+                        close()
+                    }
+                    canvas.drawPath(tri, fillPaint)
+                    canvas.drawOval(botOval, fillPaint)
+                }
+                canvas.drawLine(apexX, apexY, l, baseCy, shapePaint)
+                canvas.drawLine(apexX, apexY, r, baseCy, shapePaint)
+                canvas.drawArc(botOval, 0f, 180f, false, shapePaint)
+                canvas.drawArc(botOval, 180f, 180f, false, dashedShapePaint)
+            }
+            DirectShapeKind.SPHERE -> {
+                val rad = min(w, h) * 0.5f
+                val sphereRect = RectF(cx - rad, cy - rad, cx + rad, cy + rad)
+                val eqRy = rad * 0.32f
+                val eqRect = RectF(cx - rad, cy - eqRy, cx + rad, cy + eqRy)
+                if (hasFill) {
+                    canvas.drawOval(sphereRect, fillPaint)
+                }
+                canvas.drawOval(sphereRect, shapePaint)
+                canvas.drawArc(eqRect, 0f, 180f, false, shapePaint)
+                canvas.drawArc(eqRect, 180f, 180f, false, dashedShapePaint)
+            }
+            else -> {
+                canvas.drawRect(l, t, r, b, shapePaint)
             }
         }
     }
@@ -732,8 +1166,9 @@ class PenSheet(
                     isErasingCursor -> Color.rgb(200, 72, 84)
                     toolMode == ToolMode.HIGHLIGHTER -> highlighterColor
                     toolMode == ToolMode.TAPE -> tapeColor
-                    toolMode == ToolMode.LASER -> Color.rgb(255, 23, 68)
-                    toolMode == ToolMode.LASSO -> Color.rgb(42, 161, 183)
+                    toolMode == ToolMode.LASER -> laserColor
+                    toolMode == ToolMode.LASSO || toolMode == ToolMode.SHAPES || toolMode == ToolMode.TEXT ->
+                        Color.rgb(42, 161, 183)
                     else -> inkColor
                 }
                 paint.style = Paint.Style.STROKE
@@ -742,7 +1177,8 @@ class PenSheet(
                     isErasingCursor -> eraserRadiusDp * density
                     toolMode == ToolMode.HIGHLIGHTER -> (highlighterWidthDp * density) / 2f
                     toolMode == ToolMode.TAPE -> (tapeWidthDp * density) / 2f
-                    toolMode == ToolMode.LASSO || toolMode == ToolMode.LASER -> 6f * density
+                    toolMode == ToolMode.LASSO || toolMode == ToolMode.LASER ||
+                        toolMode == ToolMode.SHAPES || toolMode == ToolMode.TEXT -> 6f * density
                     else -> (penWidthDp * density) / 2f
                 }
                 canvas.drawCircle(x, y, max(3f * density, cursorRadius), paint)
@@ -772,8 +1208,10 @@ class PenSheet(
                         items.add(
                             ShapeItem(
                                 id = itemId,
+                                layerId = meta.layerId,
                                 shape = shape,
                                 color = meta.color,
+                                fillColor = meta.fillColor,
                                 strokeWidthWorld = meta.sizeWorld,
                                 worldBounds = shape.computeWorldBounds(meta.sizeWorld),
                                 isHighlighter = meta.isHighlighter
@@ -799,6 +1237,7 @@ class PenSheet(
 
         // Multi-finger gesture handling (2-finger zoom/pan + 2-finger tap Undo / 3-finger tap Redo)
         if (activePointer == -1 && event.pointerCount >= 2 && !isPen(event, 0) && !isPen(event, 1)) {
+            mainHandler.removeCallbacks(longPressRunnable)
             if (event.pointerCount == 2) {
                 scaleDetector.onTouchEvent(event)
             }
@@ -855,7 +1294,46 @@ class PenSheet(
             return true
         }
 
-        // Reading mode or non-drawing finger touch: pan with 1 finger or tap Study Tape to reveal/hide
+        // Virtual Ruler interaction with finger (drag or rotate ruler)
+        if (rulerEnabled && activePointer == -1 && !isPen(event, index)) {
+            val wx = screenToWorldX(event.getX(index))
+            val wy = screenToWorldY(event.getY(index))
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    val hit = hitTestRuler(wx, wy)
+                    if (hit != 0) {
+                        isRotatingRuler = (hit == 2)
+                        isDraggingRuler = (hit == 1)
+                        rulerDragLastWorld = PointF(wx, wy)
+                        return true
+                    }
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (isDraggingRuler) {
+                        val prev = rulerDragLastWorld ?: PointF(wx, wy)
+                        rulerWorldX += wx - prev.x
+                        rulerWorldY += wy - prev.y
+                        rulerDragLastWorld = PointF(wx, wy)
+                        dryInk.postInvalidateOnAnimation()
+                        return true
+                    } else if (isRotatingRuler) {
+                        val deg = Math.toDegrees(atan2((wy - rulerWorldY).toDouble(), (wx - rulerWorldX).toDouble())).toFloat()
+                        rulerAngleDeg = deg
+                        return true
+                    }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (isDraggingRuler || isRotatingRuler) {
+                        isDraggingRuler = false
+                        isRotatingRuler = false
+                        rulerDragLastWorld = null
+                        return true
+                    }
+                }
+            }
+        }
+
+        // Reading mode or non-drawing finger touch: pan with 1 finger, double-tap to fit, long-press to edit, or tap Study Tape
         val isStylusOrAllowedFinger = isPen(event, index) || (allowFingerDrawing && !readingMode)
         if (readingMode || (!isStylusOrAllowedFinger && activePointer == -1)) {
             when (event.actionMasked) {
@@ -867,28 +1345,50 @@ class PenSheet(
                     singleFingerStartX = event.getX(index)
                     singleFingerStartY = event.getY(index)
                     singleFingerMoved = false
+                    mainHandler.removeCallbacks(longPressRunnable)
+                    mainHandler.postDelayed(longPressRunnable, 480L)
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val cx = event.getX(0)
                     val cy = event.getY(0)
                     val dx = cx - singleFingerStartX
                     val dy = cy - singleFingerStartY
-                    if (readingMode && (singleFingerMoved || hypot(dx, dy) > 8f * density)) {
+                    if (hypot(dx, dy) > 10f * density) {
                         singleFingerMoved = true
+                        mainHandler.removeCallbacks(longPressRunnable)
+                    }
+                    if (readingMode && singleFingerMoved) {
                         panX += dx
                         panY += dy
                         singleFingerStartX = cx
                         singleFingerStartY = cy
                         dryInk.invalidate()
                         emitTelemetry()
-                    } else if (hypot(dx, dy) > 12f * density) {
-                        singleFingerMoved = true
                     }
                 }
                 MotionEvent.ACTION_UP -> {
+                    mainHandler.removeCallbacks(longPressRunnable)
                     if (!singleFingerMoved) {
-                        toggleTapeAtScreen(event.getX(index), event.getY(index))
+                        val ux = event.getX(index)
+                        val uy = event.getY(index)
+                        if (!toggleTapeAtScreen(ux, uy)) {
+                            val now = SystemClock.uptimeMillis()
+                            if (doubleTapFitPage &&
+                                now - lastSingleFingerTapMs <= 300L &&
+                                hypot(ux - lastSingleFingerTapX, uy - lastSingleFingerTapY) <= 28f * density
+                            ) {
+                                fitToContent()
+                                lastSingleFingerTapMs = 0L
+                            } else {
+                                lastSingleFingerTapMs = now
+                                lastSingleFingerTapX = ux
+                                lastSingleFingerTapY = uy
+                            }
+                        }
                     }
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    mainHandler.removeCallbacks(longPressRunnable)
                 }
             }
             return true
@@ -928,7 +1428,11 @@ class PenSheet(
                     wetInk.cancelStroke(id, event)
                 }
                 activeLaserTrail = null
+                directShapeStartWorld = null
+                directShapePreview = null
+                eraserLassoWorld.clear()
                 isDraggingSelection = false
+                isScalingSelection = false
                 selectionDragLastWorld = null
                 dragDx = 0f
                 dragDy = 0f
@@ -938,6 +1442,63 @@ class PenSheet(
         }
         diagnostics.postInvalidateOnAnimation()
         return true
+    }
+
+    private fun handleSingleFingerLongPress() {
+        if (isWriting || isTwoFingerGesturing || singleFingerMoved) return
+        val wx = screenToWorldX(singleFingerStartX)
+        val wy = screenToWorldY(singleFingerStartY)
+        // Find topmost unlocked TextBoxItem or ShapeItem under long-press
+        for (i in items.indices.reversed()) {
+            val item = items[i]
+            if (!isLayerVisible(item.layerId) || isLayerLocked(item.layerId)) continue
+            if (item.worldBounds.contains(wx, wy)) {
+                if (item is TextBoxItem) {
+                    onRequestTextBoxEditor(item, item.x, item.y)
+                    return
+                } else {
+                    toolMode = ToolMode.LASSO
+                    selectedIds.clear()
+                    selectedIds.add(item.id)
+                    dryInk.invalidate()
+                    emitState()
+                    return
+                }
+            }
+        }
+    }
+
+    private fun hitTestRuler(wx: Float, wy: Float): Int {
+        val dx = wx - rulerWorldX
+        val dy = wy - rulerWorldY
+        val rad = Math.toRadians(-rulerAngleDeg.toDouble())
+        val lx = (dx * cos(rad) - dy * sin(rad)).toFloat()
+        val ly = (dx * sin(rad) + dy * cos(rad)).toFloat()
+        val len = 340f * density / viewScale
+        val thick = 44f * density / viewScale
+        if (lx in (-len * 0.5f)..(len * 0.5f) && ly in 0f..thick) {
+            return if (lx >= len * 0.32f) 2 else 1
+        }
+        return 0
+    }
+
+    /** If virtual ruler is enabled and point is close to ruling edge, project onto ruler edge. */
+    private fun snapPointToRulerIfClose(wx: Float, wy: Float): PointF {
+        if (!rulerEnabled) return PointF(wx, wy)
+        val dx = wx - rulerWorldX
+        val dy = wy - rulerWorldY
+        val rad = Math.toRadians(-rulerAngleDeg.toDouble())
+        val lx = (dx * cos(rad) - dy * sin(rad)).toFloat()
+        val ly = (dx * sin(rad) + dy * cos(rad)).toFloat()
+        val len = 340f * density / viewScale
+        val snapDist = 26f * density / viewScale
+        if (lx in (-len * 0.52f)..(len * 0.52f) && abs(ly) <= snapDist) {
+            val invRad = Math.toRadians(rulerAngleDeg.toDouble())
+            val sx = rulerWorldX + (lx * cos(invRad)).toFloat()
+            val sy = rulerWorldY + (lx * sin(invRad)).toFloat()
+            return PointF(sx, sy)
+        }
+        return PointF(wx, wy)
     }
 
     override fun onHoverEvent(event: MotionEvent): Boolean {
@@ -983,6 +1544,8 @@ class PenSheet(
         activePointer = event.getPointerId(index)
         holdSnappedShape = null
         rawWorldPoints.clear()
+        directShapeStartWorld = null
+        directShapePreview = null
 
         val hardwareEraser = sideButtonPressed ||
             event.getToolType(index) == MotionEvent.TOOL_TYPE_ERASER ||
@@ -990,7 +1553,24 @@ class PenSheet(
         erasing = hardwareEraser || toolMode == ToolMode.ERASER
 
         if (erasing) {
-            eraseAtScreen(x, y)
+            if (!hardwareEraser && eraserMode == EraserMode.LASSO_ERASE) {
+                eraserLassoWorld.clear()
+                eraserLassoWorld.add(PointF(screenToWorldX(x), screenToWorldY(y)))
+                dryInk.invalidate()
+            } else {
+                eraseAtScreen(x, y)
+            }
+            return
+        }
+
+        if (toolMode == ToolMode.TEXT) {
+            val wx = screenToWorldX(x)
+            val wy = screenToWorldY(y)
+            val hitText = items.lastOrNull {
+                it is TextBoxItem && isLayerVisible(it.layerId) && !isLayerLocked(it.layerId) && it.worldBounds.contains(wx, wy)
+            } as? TextBoxItem
+            onRequestTextBoxEditor(hitText, wx, wy)
+            endPen()
             return
         }
 
@@ -998,7 +1578,7 @@ class PenSheet(
             val trail = LaserTrail(
                 points = mutableListOf(PointF(screenToWorldX(x), screenToWorldY(y))),
                 lastPointMs = SystemClock.uptimeMillis(),
-                color = 0xFFFF1744.toInt()
+                color = laserColor
             )
             activeLaserTrail = trail
             laserTrails.add(trail)
@@ -1009,25 +1589,51 @@ class PenSheet(
         if (toolMode == ToolMode.LASSO) {
             val wx = screenToWorldX(x)
             val wy = screenToWorldY(y)
-            if (selectedIds.isNotEmpty() && computeSelectionBounds().contains(wx, wy)) {
-                isDraggingSelection = true
-                selectionDragLastWorld = PointF(wx, wy)
-                dragDx = 0f
-                dragDy = 0f
-            } else {
-                selectedIds.clear()
-                isDraggingSelection = false
-                dragDx = 0f
-                dragDy = 0f
-                lassoPathWorld.clear()
-                lassoPathWorld.add(PointF(wx, wy))
-                dryInk.invalidate()
-                emitState()
+            if (selectedIds.isNotEmpty()) {
+                val bounds = computeSelectionBounds()
+                val pad = 8f * density / viewScale
+                bounds.inset(-pad, -pad)
+                val handleDist = hypot(wx - bounds.right, wy - bounds.bottom)
+                if (handleDist <= 22f * density / viewScale) {
+                    isScalingSelection = true
+                    isDraggingSelection = false
+                    scaleAnchorX = bounds.left
+                    scaleAnchorY = bounds.top
+                    scaleInitialDist = hypot(bounds.right - scaleAnchorX, bounds.bottom - scaleAnchorY).coerceAtLeast(10f)
+                    activeScaleFactor = 1f
+                    return
+                } else if (bounds.contains(wx, wy)) {
+                    isDraggingSelection = true
+                    isScalingSelection = false
+                    selectionDragLastWorld = PointF(wx, wy)
+                    dragDx = 0f
+                    dragDy = 0f
+                    return
+                }
             }
+            selectedIds.clear()
+            isDraggingSelection = false
+            isScalingSelection = false
+            dragDx = 0f
+            dragDy = 0f
+            lassoPathWorld.clear()
+            lassoPathWorld.add(PointF(wx, wy))
+            dryInk.invalidate()
+            emitState()
             return
         }
 
-        // Capture camera at stroke start (beginPen)
+        // Direct 2D / 3D Shape creation mode (Section 09 · 图形笔)
+        if (toolMode == ToolMode.SHAPES && directShapeKind != DirectShapeKind.AUTO) {
+            val startPt = PointF(screenToWorldX(x), screenToWorldY(y))
+            directShapeStartWorld = startPt
+            directShapePreview = null
+            return
+        }
+
+        // Check if active layer is locked
+        if (isLayerLocked(activeLayerId)) return
+
         val capturedScale = viewScale
         val capturedPanX = panX
         val capturedPanY = panY
@@ -1043,6 +1649,8 @@ class PenSheet(
         val activeColor = when {
             isHighlighter -> highlighterColor
             isTape -> tapeColor
+            toolMode == ToolMode.BALLPOINT && ballpointOpacity < 0.99f ->
+                applyAlpha(inkColor, (ballpointOpacity * 255).toInt())
             else -> inkColor
         }
         val baseWidthDp = when {
@@ -1060,15 +1668,19 @@ class PenSheet(
 
         val strokeId = wetInk.startStroke(event, activePointer, brush)
         activeInk = strokeId
+        val fillCol = if (shapeFillEnabled) applyAlpha(activeColor, (shapeFillOpacity * 255).toInt()) else Color.TRANSPARENT
         waitingForInk[strokeId] = PendingStrokeMeta(
             scale = capturedScale,
             panX = capturedPanX,
             panY = capturedPanY,
+            layerId = activeLayerId,
             brushType = brushType,
             color = activeColor,
+            fillColor = fillCol,
             sizeWorld = sizePx / capturedScale,
             epsilonWorld = epsilonPx / capturedScale,
             isHighlighter = isHighlighter,
+            pressureSensitivity = pressureSensitivity,
             snappedShape = null
         )
 
@@ -1076,7 +1688,8 @@ class PenSheet(
             predictor = MotionEventPredictor.newInstance(wetInk).also { it.record(event) }
         }
 
-        rawWorldPoints.add(PointF((x - capturedPanX) / capturedScale, (y - capturedPanY) / capturedScale))
+        val wPt = snapPointToRulerIfClose((x - capturedPanX) / capturedScale, (y - capturedPanY) / capturedScale)
+        rawWorldPoints.add(wPt)
         if (!isTape) {
             scheduleHoldCheck(x, y)
         }
@@ -1085,10 +1698,15 @@ class PenSheet(
     private fun movePen(event: MotionEvent, index: Int) {
         readPen(event, index)
         if (erasing) {
-            for (h in 0 until event.historySize) {
-                eraseAtScreen(event.getHistoricalX(index, h), event.getHistoricalY(index, h))
+            if (eraserLassoWorld.isNotEmpty()) {
+                eraserLassoWorld.add(PointF(screenToWorldX(x), screenToWorldY(y)))
+                dryInk.postInvalidateOnAnimation()
+            } else {
+                for (h in 0 until event.historySize) {
+                    eraseAtScreen(event.getHistoricalX(index, h), event.getHistoricalY(index, h))
+                }
+                eraseAtScreen(x, y)
             }
-            eraseAtScreen(x, y)
             return
         }
 
@@ -1111,7 +1729,11 @@ class PenSheet(
         if (toolMode == ToolMode.LASSO) {
             val wx = screenToWorldX(x)
             val wy = screenToWorldY(y)
-            if (isDraggingSelection) {
+            if (isScalingSelection) {
+                val curDist = hypot(wx - scaleAnchorX, wy - scaleAnchorY)
+                activeScaleFactor = (curDist / scaleInitialDist).coerceIn(0.25f, 4.0f)
+                dryInk.postInvalidateOnAnimation()
+            } else if (isDraggingSelection) {
                 val prev = selectionDragLastWorld ?: PointF(wx, wy)
                 val dx = wx - prev.x
                 val dy = wy - prev.y
@@ -1128,6 +1750,18 @@ class PenSheet(
             return
         }
 
+        directShapeStartWorld?.let { startPt ->
+            val curPt = PointF(screenToWorldX(x), screenToWorldY(y))
+            directShapePreview = ShapeRecognizer.buildDirectShape(
+                kind = directShapeKind,
+                start = startPt,
+                end = curPt,
+                density = density / viewScale
+            )
+            dryInk.postInvalidateOnAnimation()
+            return
+        }
+
         val strokeId = activeInk ?: return
         val meta = waitingForInk[strokeId]
         val sScale = meta?.scale ?: viewScale
@@ -1137,9 +1771,9 @@ class PenSheet(
         for (h in 0 until event.historySize) {
             val hx = event.getHistoricalX(index, h)
             val hy = event.getHistoricalY(index, h)
-            rawWorldPoints.add(PointF((hx - sPanX) / sScale, (hy - sPanY) / sScale))
+            rawWorldPoints.add(snapPointToRulerIfClose((hx - sPanX) / sScale, (hy - sPanY) / sScale))
         }
-        rawWorldPoints.add(PointF((x - sPanX) / sScale, (y - sPanY) / sScale))
+        rawWorldPoints.add(snapPointToRulerIfClose((x - sPanX) / sScale, (y - sPanY) / sScale))
 
         if (toolMode != ToolMode.TAPE && hypot(x - holdAnchorX, y - holdAnchorY) > 6f * density) {
             if (holdSnappedShape != null) {
@@ -1167,26 +1801,42 @@ class PenSheet(
                 wetInk.cancelStroke(id, event)
             }
             activeLaserTrail = null
+            directShapeStartWorld = null
+            directShapePreview = null
+            eraserLassoWorld.clear()
             lassoPathWorld.clear()
             isDraggingSelection = false
+            isScalingSelection = false
             selectionDragLastWorld = null
             dragDx = 0f
             dragDy = 0f
         } else if (erasing) {
-            eraseAtScreen(x, y)
-            if (erasedIds.isNotEmpty()) {
-                rememberBeforeChange()
-                items.removeAll { it.id in erasedIds }
-                selectedIds.removeAll(erasedIds)
-                revealedTapeIds.removeAll(erasedIds)
-                emitState()
+            if (eraserLassoWorld.size >= 3) {
+                eraseItemsInsidePolygon(eraserLassoWorld)
+                eraserLassoWorld.clear()
+            } else {
+                eraseAtScreen(x, y)
+                if (erasedIds.isNotEmpty()) {
+                    rememberBeforeChange()
+                    items.removeAll { it.id in erasedIds }
+                    selectedIds.removeAll(erasedIds)
+                    revealedTapeIds.removeAll(erasedIds)
+                    emitState()
+                }
             }
         } else if (toolMode == ToolMode.LASER) {
             activeLaserTrail?.lastPointMs = SystemClock.uptimeMillis()
             activeLaserTrail = null
             dryInk.postInvalidateOnAnimation()
         } else if (toolMode == ToolMode.LASSO) {
-            if (isDraggingSelection) {
+            if (isScalingSelection) {
+                if (abs(activeScaleFactor - 1f) > 0.02f) {
+                    rememberBeforeChange()
+                    bakeSelectionScale(scaleAnchorX, scaleAnchorY, activeScaleFactor)
+                }
+                isScalingSelection = false
+                activeScaleFactor = 1f
+            } else if (isDraggingSelection) {
                 if (hypot(dragDx, dragDy) > 0.01f) {
                     rememberBeforeChange()
                     bakeSelectionDrag(dragDx, dragDy)
@@ -1201,8 +1851,36 @@ class PenSheet(
             }
             dryInk.invalidate()
             emitState()
+        } else if (directShapeStartWorld != null) {
+            val built = directShapePreview
+            directShapeStartWorld = null
+            directShapePreview = null
+            if (built != null && !isLayerLocked(activeLayerId)) {
+                rememberBeforeChange()
+                val sizeWorld = if (adaptiveStrokeWidth) {
+                    (penWidthDp * density) / viewScale
+                } else {
+                    penWidthDp * density
+                }
+                val fillCol = if (shapeFillEnabled) applyAlpha(inkColor, (shapeFillOpacity * 255).toInt()) else Color.TRANSPARENT
+                items.add(
+                    ShapeItem(
+                        id = allocateId(),
+                        layerId = activeLayerId,
+                        shape = built,
+                        color = inkColor,
+                        fillColor = fillCol,
+                        strokeWidthWorld = sizeWorld,
+                        worldBounds = built.computeWorldBounds(sizeWorld),
+                        isHighlighter = false
+                    )
+                )
+                lastShapeDetected = built.label
+                dryInk.invalidate()
+                emitState()
+                emitTelemetry()
+            }
         } else {
-            // If user tapped a Study Tape with the stylus while in Tape mode (very short tap), toggle reveal
             if (toolMode == ToolMode.TAPE && rawWorldPoints.size <= 4) {
                 val first = rawWorldPoints.firstOrNull()
                 val last = rawWorldPoints.lastOrNull()
@@ -1220,11 +1898,24 @@ class PenSheet(
             activeInk?.let { strokeId ->
                 val existing = waitingForInk[strokeId]
                 if (existing != null) {
+                    val shouldAutoRecognize = autoShapeEnabled || toolMode == ToolMode.SHAPES
                     val finalShape = if (existing.brushType == BrushType.TAPE) {
                         null
+                    } else if (rulerEnabled && rawWorldPoints.size >= 2) {
+                        val s0 = snapPointToRulerIfClose(rawWorldPoints.first().x, rawWorldPoints.first().y)
+                        val s1 = snapPointToRulerIfClose(rawWorldPoints.last().x, rawWorldPoints.last().y)
+                        if (hypot(s0.x - rawWorldPoints.first().x, s0.y - rawWorldPoints.first().y) < 1f &&
+                            hypot(s1.x - rawWorldPoints.last().x, s1.y - rawWorldPoints.last().y) < 1f &&
+                            maxDistanceToLine(rawWorldPoints, s0, s1) < 28f * density / existing.scale
+                        ) {
+                            RecognizedShape.Line(s0, s1)
+                        } else {
+                            holdSnappedShape
+                                ?: if (shouldAutoRecognize) ShapeRecognizer.recognize(rawWorldPoints, density / existing.scale) else null
+                        }
                     } else {
                         holdSnappedShape
-                            ?: if (autoShapeEnabled) ShapeRecognizer.recognize(rawWorldPoints, density / existing.scale) else null
+                            ?: if (shouldAutoRecognize) ShapeRecognizer.recognize(rawWorldPoints, density / existing.scale) else null
                     }
                     waitingForInk[strokeId] = existing.copy(snappedShape = finalShape)
                 } else {
@@ -1237,12 +1928,26 @@ class PenSheet(
         endPen()
     }
 
+    private fun maxDistanceToLine(pts: List<PointF>, a: PointF, b: PointF): Float {
+        val dx = b.x - a.x
+        val dy = b.y - a.y
+        val len = hypot(dx, dy)
+        if (len < 1e-3f) return 0f
+        var mx = 0f
+        for (p in pts) {
+            val d = abs((p.x - a.x) * dy - (p.y - a.y) * dx) / len
+            if (d > mx) mx = d
+        }
+        return mx
+    }
+
     private fun endPen() {
         mainHandler.removeCallbacks(holdRunnable)
         predictor = null
         activeInk = null
         activePointer = -1
         erasing = false
+        partialEraseRecordedUndo = false
         lastEraseWorld = null
         holdSnappedShape = null
         rawWorldPoints.clear()
@@ -1258,7 +1963,7 @@ class PenSheet(
         val hitRadius = (10f * density) / viewScale
         for (i in items.indices.reversed()) {
             val item = items[i]
-            if (!item.isTape || item !is InkItem) continue
+            if (!item.isTape || item !is InkItem || !isLayerVisible(item.layerId)) continue
             val b = item.worldBounds
             if (wx < b.left - hitRadius || wx > b.right + hitRadius ||
                 wy < b.top - hitRadius || wy > b.bottom + hitRadius
@@ -1297,21 +2002,56 @@ class PenSheet(
         }
     }
 
+    private fun canEraseItem(item: CanvasItem): Boolean {
+        if (!isLayerVisible(item.layerId) || isLayerLocked(item.layerId)) return false
+        if (eraseOnlyHighlighter && !item.isHighlighter) return false
+        if (eraseOnlyTape && !item.isTape) return false
+        return true
+    }
+
+    private fun eraseItemsInsidePolygon(poly: List<PointF>) {
+        val toRemove = mutableSetOf<Long>()
+        for (item in items) {
+            if (!canEraseItem(item)) continue
+            val b = item.worldBounds
+            if (isPointInPolygon(b.centerX(), b.centerY(), poly) ||
+                isPointInPolygon(b.left, b.top, poly) ||
+                isPointInPolygon(b.right, b.bottom, poly)
+            ) {
+                toRemove.add(item.id)
+            }
+        }
+        if (toRemove.isNotEmpty()) {
+            rememberBeforeChange()
+            items.removeAll { it.id in toRemove }
+            selectedIds.removeAll(toRemove)
+            revealedTapeIds.removeAll(toRemove)
+            dryInk.invalidate()
+            emitState()
+        }
+    }
+
     private fun eraseAtScreen(sx: Float, sy: Float) {
         val wx = screenToWorldX(sx)
         val wy = screenToWorldY(sy)
         val worldRadius = (eraserRadiusDp * density) / viewScale
         val start = lastEraseWorld ?: PointF(wx, wy)
         val steps = ceil(hypot(wx - start.x, wy - start.y) / worldRadius).toInt().coerceAtLeast(1)
-        val before = erasedIds.size
 
+        if (eraserMode == EraserMode.PIXEL) {
+            partialPixelEraseSegment(start, PointF(wx, wy), steps, worldRadius)
+            lastEraseWorld = PointF(wx, wy)
+            return
+        }
+
+        val before = erasedIds.size
         for (step in 1..steps) {
             val progress = step.toFloat() / steps
             val px = start.x + (wx - start.x) * progress
             val py = start.y + (wy - start.y) * progress
 
             for (item in items) {
-                if (item.id in erasedIds) continue
+                if (item.id in erasedIds || !canEraseItem(item)) continue
                 val b = item.worldBounds
                 if (px < b.left - worldRadius || px > b.right + worldRadius ||
                     py < b.top - worldRadius || py > b.bottom + worldRadius
@@ -1332,6 +2072,7 @@ class PenSheet(
                             hypot(pt.x - px, pt.y - py) <= threshold
                         }
                     }
+                    is TextBoxItem -> b.contains(px, py)
                 }
                 if (hit) erasedIds.add(item.id)
             }
@@ -1340,18 +2081,139 @@ class PenSheet(
         if (before != erasedIds.size) dryInk.postInvalidateOnAnimation()
     }
 
+    /** Pixel/Partial eraser (Section 09 · 像素擦除): splits InkItem strokes at points covered by the eraser. */
+    private var partialEraseRecordedUndo = false
+    private fun partialPixelEraseSegment(start: PointF, end: PointF, steps: Int, worldRadius: Float) {
+        var modified = false
+        val nextItems = ArrayList<CanvasItem>(items.size + 4)
+
+        for (item in items) {
+            if (!canEraseItem(item) || item !is InkItem) {
+                nextItems.add(item)
+                continue
+            }
+            val b = item.worldBounds
+            val segMinX = min(start.x, end.x) - worldRadius
+            val segMaxX = max(start.x, end.x) + worldRadius
+            val segMinY = min(start.y, end.y) - worldRadius
+            val segMaxY = max(start.y, end.y) + worldRadius
+            if (b.right < segMinX || b.left > segMaxX || b.bottom < segMinY || b.top > segMaxY) {
+                nextItems.add(item)
+                continue
+            }
+
+            val hitRadius = worldRadius + item.data.sizeWorld * 0.45f
+            val pts = item.data.points
+            var anyHit = false
+            val keepFlags = BooleanArray(pts.size) { idx ->
+                val pt = pts[idx]
+                var hit = false
+                for (s in 1..steps) {
+                    val t = s.toFloat() / steps
+                    val px = start.x + (end.x - start.x) * t
+                    val py = start.y + (end.y - start.y) * t
+                    if (hypot(pt.x - px, pt.y - py) <= hitRadius) {
+                        hit = true
+                        break
+                    }
+                }
+                if (hit) anyHit = true
+                !hit
+            }
+
+            if (!anyHit) {
+                nextItems.add(item)
+                continue
+            }
+
+            if (!partialEraseRecordedUndo) {
+                rememberBeforeChange()
+                partialEraseRecordedUndo = true
+            }
+            modified = true
+
+            // Split contiguous kept points into new InkItems
+            var runStart = -1
+            for (i in pts.indices) {
+                if (keepFlags[i]) {
+                    if (runStart == -1) runStart = i
+                } else if (runStart != -1) {
+                    val subPts = pts.subList(runStart, i)
+                    if (subPts.size >= 2) {
+                        val subData = item.data.copy(points = subPts.toList())
+                        val subStroke = buildStrokeFromData(subData)
+                        nextItems.add(
+                            InkItem(
+                                id = allocateId(),
+                                layerId = item.layerId,
+                                data = subData,
+                                stroke = subStroke,
+                                worldBounds = computeStrokeWorldBounds(subStroke, subData),
+                                isHighlighter = item.isHighlighter
+                            )
+                        )
+                    }
+                    runStart = -1
+                }
+            }
+            if (runStart != -1) {
+                val subPts = pts.subList(runStart, pts.size)
+                if (subPts.size >= 2) {
+                    val subData = item.data.copy(points = subPts.toList())
+                    val subStroke = buildStrokeFromData(subData)
+                    nextItems.add(
+                        InkItem(
+                            id = allocateId(),
+                            layerId = item.layerId,
+                            data = subData,
+                            stroke = subStroke,
+                            worldBounds = computeStrokeWorldBounds(subStroke, subData),
+                            isHighlighter = item.isHighlighter
+                        )
+                    )
+                }
+            }
+        }
+
+        if (modified) {
+            items.clear()
+            items.addAll(nextItems)
+            dryInk.postInvalidateOnAnimation()
+            emitState()
+        }
+    }
+
     private fun selectItemsInsideLasso() {
         selectedIds.clear()
-        if (lassoPathWorld.size < 3) return
+        if (lassoPathWorld.size < 2) return
+        val rectFilter = if (lassoMode == LassoMode.RECTANGLE) {
+            val f = lassoPathWorld.first()
+            val l = lassoPathWorld.last()
+            RectF(min(f.x, l.x), min(f.y, l.y), max(f.x, l.x), max(f.y, l.y))
+        } else {
+            null
+        }
+        if (rectFilter == null && lassoPathWorld.size < 3) return
+
         for (item in items) {
+            if (!isLayerVisible(item.layerId) || isLayerLocked(item.layerId)) continue
+            val allowedByType = when (item) {
+                is InkItem -> lassoSelectInk
+                is ShapeItem -> lassoSelectShapes
+                is TextBoxItem -> lassoSelectText
+            }
+            if (!allowedByType) continue
+
             val b = item.worldBounds
             if (b.isEmpty) continue
-            val cx = b.centerX()
-            val cy = b.centerY()
-            if (isPointInPolygon(cx, cy, lassoPathWorld) ||
-                isPointInPolygon(b.left, b.top, lassoPathWorld) ||
-                isPointInPolygon(b.right, b.bottom, lassoPathWorld)
-            ) {
+            val matched = if (rectFilter != null) {
+                RectF.intersects(rectFilter, b)
+            } else {
+                isPointInPolygon(b.centerX(), b.centerY(), lassoPathWorld) ||
+                    isPointInPolygon(b.left, b.top, lassoPathWorld) ||
+                    isPointInPolygon(b.right, b.bottom, lassoPathWorld)
+            }
+            if (matched) {
                 selectedIds.add(item.id)
             }
         }
@@ -1383,8 +2245,13 @@ class PenSheet(
                 }
             }
         }
-        if (!out.isEmpty && isDraggingSelection) {
-            out.offset(dragDx, dragDy)
+        if (!out.isEmpty) {
+            if (isDraggingSelection) {
+                out.offset(dragDx, dragDy)
+            } else if (isScalingSelection) {
+                out.right = scaleAnchorX + (out.right - scaleAnchorX) * activeScaleFactor
+                out.bottom = scaleAnchorY + (out.bottom - scaleAnchorY) * activeScaleFactor
+            }
         }
         return out
     }
@@ -1397,6 +2264,152 @@ class PenSheet(
             }
         }
     }
+
+    private fun bakeSelectionScale(anchorX: Float, anchorY: Float, factor: Float) {
+        for (i in items.indices) {
+            val item = items[i]
+            if (item.id in selectedIds) {
+                items[i] = item.scaled(anchorX, anchorY, factor, newId = item.id)
+            }
+        }
+    }
+
+    /** Adds or updates a rich TextBoxItem in world coordinates (Section 13 · 文本框). */
+    fun addOrUpdateTextBox(
+        existingId: Long?,
+        worldX: Float,
+        worldY: Float,
+        text: String,
+        color: Int,
+        bgColor: Int,
+        fontSizeDp: Float,
+        isBold: Boolean,
+        isItalic: Boolean,
+        isUnderline: Boolean
+    ) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) {
+            if (existingId != null) {
+                rememberBeforeChange()
+                items.removeAll { it.id == existingId }
+                dryInk.invalidate()
+                emitState()
+            }
+            return
+        }
+        rememberBeforeChange()
+        val fontSizeWorld = (fontSizeDp * density) / viewScale
+        textPaint.textSize = fontSizeWorld
+        val style = when {
+            isBold && isItalic -> Typeface.BOLD_ITALIC
+            isBold -> Typeface.BOLD
+            isItalic -> Typeface.ITALIC
+            else -> Typeface.NORMAL
+        }
+        textPaint.typeface = Typeface.create(Typeface.DEFAULT, style)
+        val lines = trimmed.split('\n')
+        val maxW = lines.maxOfOrNull { textPaint.measureText(it) } ?: (40f * density)
+        val totalH = lines.size * (fontSizeWorld * 1.3f) + 8f
+        val bounds = RectF(worldX, worldY, worldX + maxW + 14f, worldY + totalH)
+
+        val newItem = TextBoxItem(
+            id = existingId ?: allocateId(),
+            layerId = activeLayerId,
+            x = worldX,
+            y = worldY,
+            text = trimmed,
+            color = color,
+            bgColor = bgColor,
+            fontSizeWorld = fontSizeWorld,
+            isBold = isBold,
+            isItalic = isItalic,
+            isUnderline = isUnderline,
+            worldBounds = bounds
+        )
+        val idx = if (existingId != null) items.indexOfFirst { it.id == existingId } else -1
+        if (idx >= 0) {
+            items[idx] = newItem
+        } else {
+            items.add(newItem)
+        }
+        dryInk.invalidate()
+        emitState()
+    }
+
+    // Layer management operations (Section 19 · 图层)
+    fun addLayer(name: String): NoteLayer {
+        val newId = (layers.maxOfOrNull { it.id } ?: 0) + 1
+        val layer = NoteLayer(id = newId, name = name)
+        layers.add(layer)
+        activeLayerId = newId
+        return layer
+    }
+
+    fun toggleLayerVisibility(layerId: Int) {
+        val idx = layers.indexOfFirst { it.id == layerId }
+        if (idx >= 0) {
+            layers[idx] = layers[idx].copy(visible = !layers[idx].visible)
+            dryInk.invalidate()
+        }
+    }
+
+    fun toggleLayerLock(layerId: Int) {
+        val idx = layers.indexOfFirst { it.id == layerId }
+        if (idx >= 0) {
+            layers[idx] = layers[idx].copy(locked = !layers[idx].locked)
+        }
+    }
+
+    fun mergeLayerDown(layerId: Int): Boolean {
+        val idx = layers.indexOfFirst { it.id == layerId }
+        if (idx <= 0) return false
+        val targetId = layers[idx - 1].id
+        rememberBeforeChange()
+        for (i in items.indices) {
+            if (items[i].layerId == layerId) {
+                items[i] = items[i].withLayer(targetId)
+            }
+        }
+        layers.removeAt(idx)
+        if (activeLayerId == layerId) activeLayerId = targetId
+        dryInk.invalidate()
+        return true
+    }
+
+    /** Minimap data & navigation jump for Infinite Canvas (Section 03 · 无限画布). */
+    fun computeMinimapState(): Pair<RectF, RectF> {
+        val viewport = RectF(
+            -panX / viewScale,
+            -panY / viewScale,
+            (width.coerceAtLeast(1) - panX) / viewScale,
+            (height.coerceAtLeast(1) - panY) / viewScale
+        )
+        val content = RectF(viewport)
+        for (item in items) {
+            if (!item.worldBounds.isEmpty) {
+                content.union(item.worldBounds)
+            }
+        }
+        content.inset(-120f * density, -120f * density)
+        return content to viewport
+    }
+
+    fun jumpCameraToWorldCenter(worldCx: Float, worldCy: Float) {
+        panX = width * 0.5f - worldCx * viewScale
+        panY = height * 0.5f - worldCy * viewScale
+        dryInk.invalidate()
+        emitTelemetry()
+    }
+
+    fun snapshotItemBoundsForMinimap(): List<Pair<RectF, Int>> =
+        items.filter { isLayerVisible(it.layerId) }.map { item ->
+            val col = when (item) {
+                is InkItem -> item.data.color
+                is ShapeItem -> item.color
+                is TextBoxItem -> item.color
+            }
+            item.worldBounds to col
+        }
 
     fun recolorSelection(newColor: Int) {
         if (isWriting || selectedIds.isEmpty()) return
@@ -1442,6 +2455,7 @@ class PenSheet(
         if (selectedIds.isEmpty()) return
         selectedIds.clear()
         isDraggingSelection = false
+        isScalingSelection = false
         dragDx = 0f
         dragDy = 0f
         dryInk.invalidate()
@@ -1456,7 +2470,6 @@ class PenSheet(
         emitTelemetry()
     }
 
-    /** Fits all content within a 32 dp margin (clamped to 45%..400%). Aligns top-left if content exceeds view at 45%. */
     fun fitToContent() {
         if (items.isEmpty() || width <= 0 || height <= 0) {
             resetZoom()
@@ -1464,6 +2477,7 @@ class PenSheet(
         }
         val contentBounds = RectF()
         for (item in items) {
+            if (!isLayerVisible(item.layerId)) continue
             val b = item.worldBounds
             if (!b.isEmpty) {
                 if (contentBounds.isEmpty) contentBounds.set(b) else contentBounds.union(b)
@@ -1546,7 +2560,6 @@ class PenSheet(
         selectedIds.clear()
         dryInk.invalidate()
         emitState()
-        return true
     }
 
     fun clear() {
@@ -1562,11 +2575,14 @@ class PenSheet(
     fun exportBitmap(): Bitmap? {
         if (width <= 0 || height <= 0) return null
         val prevSelected = selectedIds.toSet()
+        val prevRuler = rulerEnabled
         selectedIds.clear()
+        rulerEnabled = false
         val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         dryInk.draw(canvas)
         selectedIds.addAll(prevSelected)
+        rulerEnabled = prevRuler
         return bmp
     }
 
@@ -1602,6 +2618,7 @@ class PenSheet(
         }
         return InkItem(
             id = id,
+            layerId = meta.layerId,
             data = strokeData,
             stroke = worldStroke,
             worldBounds = computeStrokeWorldBounds(worldStroke, strokeData),
@@ -1618,21 +2635,28 @@ class PenSheet(
         val count = inputs.size
         val pts = ArrayList<StrokePoint>(count)
         val scratch = StrokeInput()
+        val pSens = meta.pressureSensitivity.coerceIn(0f, 1.5f)
         for (i in 0 until count) {
             inputs.populate(i, scratch)
-            val wx = (scratch.x - meta.panX) / meta.scale
-            val wy = (scratch.y - meta.panY) / meta.scale
+            val rawWx = (scratch.x - meta.panX) / meta.scale
+            val rawWy = (scratch.y - meta.panY) / meta.scale
+            val snapped = snapPointToRulerIfClose(rawWx, rawWy)
             val unitCm = if (scratch.strokeUnitLengthCm != StrokeInput.NO_STROKE_UNIT_LENGTH) {
                 scratch.strokeUnitLengthCm * meta.scale
             } else {
                 StrokeInput.NO_STROKE_UNIT_LENGTH
             }
+            val adjPressure = if (scratch.pressure != StrokeInput.NO_PRESSURE && pSens != 1f) {
+                (0.5f + (scratch.pressure - 0.5f) * pSens).coerceIn(0.05f, 1f)
+            } else {
+                scratch.pressure
+            }
             pts.add(
                 StrokePoint(
-                    x = wx,
-                    y = wy,
+                    x = snapped.x,
+                    y = snapped.y,
                     elapsedTimeMillis = scratch.elapsedTimeMillis,
-                    pressure = scratch.pressure,
+                    pressure = adjPressure,
                     tiltRadians = scratch.tiltRadians,
                     orientationRadians = scratch.orientationRadians,
                     strokeUnitLengthCm = unitCm
@@ -1654,6 +2678,9 @@ class PenSheet(
         val worldStroke = buildStrokeFromData(data)
         return data to worldStroke
     }
+
+    private fun applyAlpha(color: Int, alpha: Int): Int =
+        (color and 0x00FFFFFF) or (alpha.coerceIn(0, 255) shl 24)
 }
 
 private fun InputToolType.toCode(): Int = when (this) {

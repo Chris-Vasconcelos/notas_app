@@ -16,6 +16,7 @@ import kotlin.math.sqrt
 sealed class RecognizedShape(val label: String) {
     abstract fun samplePoints(stepPx: Float = 8f): List<PointF>
     abstract fun translated(dx: Float, dy: Float): RecognizedShape
+    abstract fun scaled(anchorX: Float, anchorY: Float, factor: Float): RecognizedShape
     abstract fun computeWorldBounds(strokeWidthWorld: Float): RectF
 
     class Line(val start: PointF, val end: PointF) : RecognizedShape("Línea") {
@@ -25,6 +26,9 @@ sealed class RecognizedShape(val label: String) {
         override fun translated(dx: Float, dy: Float): Line =
             Line(PointF(start.x + dx, start.y + dy), PointF(end.x + dx, end.y + dy))
 
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float): Line =
+            Line(scalePt(start, anchorX, anchorY, factor), scalePt(end, anchorX, anchorY, factor))
+
         override fun computeWorldBounds(strokeWidthWorld: Float): RectF =
             inflatedBounds(
                 min(start.x, end.x),
@@ -33,6 +37,61 @@ sealed class RecognizedShape(val label: String) {
                 max(start.y, end.y),
                 strokeWidthWorld
             )
+    }
+
+    class WavyLine(
+        val start: PointF,
+        val end: PointF,
+        val amplitude: Float,
+        val wavelength: Float
+    ) : RecognizedShape("Línea ondulada") {
+        override fun samplePoints(stepPx: Float): List<PointF> {
+            val dist = hypot(end.x - start.x, end.y - start.y)
+            if (dist < 2f) return listOf(start, end)
+            val ux = (end.x - start.x) / dist
+            val uy = (end.y - start.y) / dist
+            val nx = -uy
+            val ny = ux
+            val steps = max(24, (dist / (stepPx * 0.4f)).toInt())
+            val pts = ArrayList<PointF>(steps + 1)
+            val wl = wavelength.coerceAtLeast(8f)
+            for (i in 0..steps) {
+                val d = (i.toFloat() / steps) * dist
+                val wave = sin((2.0 * PI * d) / wl).toFloat() * amplitude
+                pts.add(
+                    PointF(
+                        start.x + ux * d + nx * wave,
+                        start.y + uy * d + ny * wave
+                    )
+                )
+            }
+            return pts
+        }
+
+        override fun translated(dx: Float, dy: Float): WavyLine = WavyLine(
+            start = PointF(start.x + dx, start.y + dy),
+            end = PointF(end.x + dx, end.y + dy),
+            amplitude = amplitude,
+            wavelength = wavelength
+        )
+
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float): WavyLine = WavyLine(
+            start = scalePt(start, anchorX, anchorY, factor),
+            end = scalePt(end, anchorX, anchorY, factor),
+            amplitude = amplitude * factor,
+            wavelength = wavelength * factor
+        )
+
+        override fun computeWorldBounds(strokeWidthWorld: Float): RectF {
+            val pad = amplitude + strokeWidthWorld
+            return inflatedBounds(
+                min(start.x, end.x) - pad,
+                min(start.y, end.y) - pad,
+                max(start.x, end.x) + pad,
+                max(start.y, end.y) + pad,
+                strokeWidthWorld
+            )
+        }
     }
 
     class Arrow(
@@ -57,6 +116,13 @@ sealed class RecognizedShape(val label: String) {
             wingRight = PointF(wingRight.x + dx, wingRight.y + dy)
         )
 
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float): Arrow = Arrow(
+            start = scalePt(start, anchorX, anchorY, factor),
+            end = scalePt(end, anchorX, anchorY, factor),
+            wingLeft = scalePt(wingLeft, anchorX, anchorY, factor),
+            wingRight = scalePt(wingRight, anchorX, anchorY, factor)
+        )
+
         override fun computeWorldBounds(strokeWidthWorld: Float): RectF {
             val minX = minOf(start.x, end.x, wingLeft.x, wingRight.x)
             val minY = minOf(start.y, end.y, wingLeft.y, wingRight.y)
@@ -64,6 +130,81 @@ sealed class RecognizedShape(val label: String) {
             val maxY = maxOf(start.y, end.y, wingLeft.y, wingRight.y)
             return inflatedBounds(minX, minY, maxX, maxY, strokeWidthWorld)
         }
+    }
+
+    class CoordinateAxes(
+        val left: Float,
+        val top: Float,
+        val right: Float,
+        val bottom: Float
+    ) : RecognizedShape("Ejes X-Y") {
+        val originX: Float get() = (left + right) * 0.5f
+        val originY: Float get() = (top + bottom) * 0.5f
+
+        override fun samplePoints(stepPx: Float): List<PointF> {
+            val pts = mutableListOf<PointF>()
+            pts += sampleSegment(PointF(left, originY), PointF(right, originY), stepPx)
+            pts += sampleSegment(PointF(originX, bottom), PointF(originX, top), stepPx)
+            return pts
+        }
+
+        override fun translated(dx: Float, dy: Float): CoordinateAxes = CoordinateAxes(
+            left = left + dx,
+            top = top + dy,
+            right = right + dx,
+            bottom = bottom + dy
+        )
+
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float): CoordinateAxes = CoordinateAxes(
+            left = anchorX + (left - anchorX) * factor,
+            top = anchorY + (top - anchorY) * factor,
+            right = anchorX + (right - anchorX) * factor,
+            bottom = anchorY + (bottom - anchorY) * factor
+        )
+
+        override fun computeWorldBounds(strokeWidthWorld: Float): RectF =
+            inflatedBounds(min(left, right), min(top, bottom), max(left, right), max(top, bottom), strokeWidthWorld)
+    }
+
+    class Shape3D(
+        val kind: DirectShapeKind,
+        val left: Float,
+        val top: Float,
+        val right: Float,
+        val bottom: Float
+    ) : RecognizedShape(kind.label) {
+        override fun samplePoints(stepPx: Float): List<PointF> {
+            val tl = PointF(left, top)
+            val tr = PointF(right, top)
+            val br = PointF(right, bottom)
+            val bl = PointF(left, bottom)
+            val pts = mutableListOf<PointF>()
+            pts += sampleSegment(tl, tr, stepPx)
+            pts += sampleSegment(tr, br, stepPx)
+            pts += sampleSegment(br, bl, stepPx)
+            pts += sampleSegment(bl, tl, stepPx)
+            pts += sampleSegment(tl, br, stepPx)
+            return pts
+        }
+
+        override fun translated(dx: Float, dy: Float): Shape3D = Shape3D(
+            kind = kind,
+            left = left + dx,
+            top = top + dy,
+            right = right + dx,
+            bottom = bottom + dy
+        )
+
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float): Shape3D = Shape3D(
+            kind = kind,
+            left = anchorX + (left - anchorX) * factor,
+            top = anchorY + (top - anchorY) * factor,
+            right = anchorX + (right - anchorX) * factor,
+            bottom = anchorY + (bottom - anchorY) * factor
+        )
+
+        override fun computeWorldBounds(strokeWidthWorld: Float): RectF =
+            inflatedBounds(min(left, right), min(top, bottom), max(left, right), max(top, bottom), strokeWidthWorld)
     }
 
     class Rectangle(
@@ -94,6 +235,14 @@ sealed class RecognizedShape(val label: String) {
             isSquare = isSquare
         )
 
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float): Rectangle = Rectangle(
+            left = anchorX + (left - anchorX) * factor,
+            top = anchorY + (top - anchorY) * factor,
+            right = anchorX + (right - anchorX) * factor,
+            bottom = anchorY + (bottom - anchorY) * factor,
+            isSquare = isSquare
+        )
+
         override fun computeWorldBounds(strokeWidthWorld: Float): RectF =
             inflatedBounds(min(left, right), min(top, bottom), max(left, right), max(top, bottom), strokeWidthWorld)
     }
@@ -115,6 +264,12 @@ sealed class RecognizedShape(val label: String) {
             a = PointF(a.x + dx, a.y + dy),
             b = PointF(b.x + dx, b.y + dy),
             c = PointF(c.x + dx, c.y + dy)
+        )
+
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float): Triangle = Triangle(
+            a = scalePt(a, anchorX, anchorY, factor),
+            b = scalePt(b, anchorX, anchorY, factor),
+            c = scalePt(c, anchorX, anchorY, factor)
         )
 
         override fun computeWorldBounds(strokeWidthWorld: Float): RectF {
@@ -157,11 +312,18 @@ sealed class RecognizedShape(val label: String) {
             isCircle = isCircle
         )
 
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float): Ellipse = Ellipse(
+            cx = anchorX + (cx - anchorX) * factor,
+            cy = anchorY + (cy - anchorY) * factor,
+            rx = rx * factor,
+            ry = ry * factor,
+            isCircle = isCircle
+        )
+
         override fun computeWorldBounds(strokeWidthWorld: Float): RectF =
             inflatedBounds(cx - rx, cy - ry, cx + rx, cy + ry, strokeWidthWorld)
     }
 
-    /** Closed multi-vertex polygon: Rombo, Paralelogramo, Trapecio, Pentágono, Hexágono, Estrella. */
     class Polygon(
         val vertices: List<PointF>,
         val shapeLabel: String
@@ -183,6 +345,11 @@ sealed class RecognizedShape(val label: String) {
             shapeLabel = shapeLabel
         )
 
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float): Polygon = Polygon(
+            vertices = vertices.map { scalePt(it, anchorX, anchorY, factor) },
+            shapeLabel = shapeLabel
+        )
+
         override fun computeWorldBounds(strokeWidthWorld: Float): RectF {
             var minX = Float.POSITIVE_INFINITY
             var minY = Float.POSITIVE_INFINITY
@@ -198,7 +365,6 @@ sealed class RecognizedShape(val label: String) {
         }
     }
 
-    /** Open multi-segment polyline: Ejes L, Ángulo, Ruta/Cable, Pulso. */
     class Polyline(
         val vertices: List<PointF>,
         val shapeLabel: String = "Polilínea"
@@ -218,6 +384,11 @@ sealed class RecognizedShape(val label: String) {
             shapeLabel = shapeLabel
         )
 
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float): Polyline = Polyline(
+            vertices = vertices.map { scalePt(it, anchorX, anchorY, factor) },
+            shapeLabel = shapeLabel
+        )
+
         override fun computeWorldBounds(strokeWidthWorld: Float): RectF {
             var minX = Float.POSITIVE_INFINITY
             var minY = Float.POSITIVE_INFINITY
@@ -233,7 +404,6 @@ sealed class RecognizedShape(val label: String) {
         }
     }
 
-    /** Smooth open quadratic curve / circular arc. */
     class Arc(
         val start: PointF,
         val control: PointF,
@@ -260,6 +430,12 @@ sealed class RecognizedShape(val label: String) {
             end = PointF(end.x + dx, end.y + dy)
         )
 
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float): Arc = Arc(
+            start = scalePt(start, anchorX, anchorY, factor),
+            control = scalePt(control, anchorX, anchorY, factor),
+            end = scalePt(end, anchorX, anchorY, factor)
+        )
+
         override fun computeWorldBounds(strokeWidthWorld: Float): RectF {
             val pts = samplePoints(12f)
             var minX = Float.POSITIVE_INFINITY
@@ -275,6 +451,9 @@ sealed class RecognizedShape(val label: String) {
             return inflatedBounds(minX, minY, maxX, maxY, strokeWidthWorld)
         }
     }
+
+    protected fun scalePt(p: PointF, ax: Float, ay: Float, f: Float): PointF =
+        PointF(ax + (p.x - ax) * f, ay + (p.y - ay) * f)
 
     protected fun inflatedBounds(
         minX: Float,
@@ -301,11 +480,104 @@ private fun sampleSegment(a: PointF, b: PointF, stepPx: Float): List<PointF> {
 
 object ShapeRecognizer {
 
+    /** Builds a direct 2D or 3D geometric shape from drag endpoints (Section 09 · Pluma de Figuras). */
+    fun buildDirectShape(
+        kind: DirectShapeKind,
+        start: PointF,
+        end: PointF,
+        density: Float
+    ): RecognizedShape? {
+        val dist = hypot(end.x - start.x, end.y - start.y)
+        if (dist < 10f * density) return null
+
+        val left = min(start.x, end.x)
+        val right = max(start.x, end.x)
+        val top = min(start.y, end.y)
+        val bottom = max(start.y, end.y)
+        val w = (right - left).coerceAtLeast(12f * density)
+        val h = (bottom - top).coerceAtLeast(12f * density)
+        val cx = (left + right) * 0.5f
+        val cy = (top + bottom) * 0.5f
+
+        return when (kind) {
+            DirectShapeKind.AUTO -> null
+            DirectShapeKind.LINE -> {
+                val snapped = snapLineEndpoints(start, end)
+                RecognizedShape.Line(snapped.first, snapped.second)
+            }
+            DirectShapeKind.WAVY -> {
+                val snapped = snapLineEndpoints(start, end)
+                RecognizedShape.WavyLine(
+                    start = snapped.first,
+                    end = snapped.second,
+                    amplitude = 6f * density,
+                    wavelength = 24f * density
+                )
+            }
+            DirectShapeKind.ARROW -> {
+                val snapped = snapLineEndpoints(start, end)
+                val sStart = snapped.first
+                val sTip = snapped.second
+                val angle = atan2(sTip.y - sStart.y, sTip.x - sStart.x)
+                val headLen = max(14f * density, min(28f * density, dist * 0.22f))
+                val wingAngle = 0.52f
+                RecognizedShape.Arrow(
+                    start = sStart,
+                    end = sTip,
+                    wingLeft = PointF(sTip.x - headLen * cos(angle - wingAngle), sTip.y - headLen * sin(angle - wingAngle)),
+                    wingRight = PointF(sTip.x - headLen * cos(angle + wingAngle), sTip.y - headLen * sin(angle + wingAngle))
+                )
+            }
+            DirectShapeKind.AXES -> RecognizedShape.CoordinateAxes(left, top, right, bottom)
+            DirectShapeKind.PARABOLA -> {
+                val pStart = PointF(left, top)
+                val pEnd = PointF(right, top)
+                val vertex = PointF(cx, bottom)
+                val ctrl = PointF(2f * vertex.x - cx, 2f * vertex.y - top)
+                RecognizedShape.Arc(pStart, ctrl, pEnd)
+            }
+            DirectShapeKind.RECTANGLE -> {
+                val isSq = min(w, h) / max(w, h) >= 0.88f
+                RecognizedShape.Rectangle(left, top, right, bottom, isSq)
+            }
+            DirectShapeKind.TRIANGLE -> RecognizedShape.Triangle(
+                a = PointF(cx, top),
+                b = PointF(right, bottom),
+                c = PointF(left, bottom)
+            )
+            DirectShapeKind.DIAMOND -> RecognizedShape.Polygon(
+                listOf(PointF(cx, top), PointF(right, cy), PointF(cx, bottom), PointF(left, cy)),
+                "Rombo"
+            )
+            DirectShapeKind.PENTAGON -> {
+                val r = min(w, h) * 0.5f
+                val verts = List(5) { i ->
+                    val a = -PI / 2.0 + (2.0 * PI * i) / 5.0
+                    PointF(cx + (r * cos(a)).toFloat(), cy + (r * sin(a)).toFloat())
+                }
+                RecognizedShape.Polygon(verts, "Pentágono")
+            }
+            DirectShapeKind.STAR -> {
+                val r = min(w, h) * 0.5f
+                RecognizedShape.Polygon(buildRegularStar(cx, cy, 5, r), "Estrella")
+            }
+            DirectShapeKind.ELLIPSE -> {
+                val rx = w * 0.5f
+                val ry = h * 0.5f
+                val isCircle = min(rx, ry) / max(rx, ry) >= 0.86f
+                RecognizedShape.Ellipse(cx, cy, rx, ry, isCircle)
+            }
+            DirectShapeKind.CUBE,
+            DirectShapeKind.CYLINDER,
+            DirectShapeKind.CONE,
+            DirectShapeKind.SPHERE -> RecognizedShape.Shape3D(kind, left, top, right, bottom)
+        }
+    }
+
     fun recognize(rawPoints: List<PointF>, density: Float): RecognizedShape? {
         if (rawPoints.size < 5) return null
         val minSize = 20f * density
 
-        // Trim stationary hold tail and resample equidistantly to eliminate speed bias
         val pts = resampleEquidistant(rawPoints, max(2.5f * density, 1.5f), maxPoints = 96)
         if (pts.size < 5) return null
 
@@ -344,10 +616,10 @@ object ShapeRecognizer {
             }
         }
 
-        // 2. Single-stroke Arrow check (straight shaft from start to farthest point + tip hook/wings)
+        // 2. Single-stroke Arrow check
         recognizeSingleStrokeArrow(pts, density, minSize)?.let { return it }
 
-        // 3. Closed shapes (Triangles, Quads, Rombo, Paralelogramo, Trapecio, Pentágono, Hexágono, Estrella, Círculo, Elipse)
+        // 3. Closed shapes
         val isClosed = endGap <= max(32f * density, diag * 0.32f) && pathLen > diag * 1.7f
         if (isClosed) {
             recognizeClosedShape(pts, minX, maxX, minY, maxY, diag, density)?.let { return it }
@@ -376,7 +648,6 @@ object ShapeRecognizer {
         val cx = (minX + maxX) * 0.5f
         val cy = (minY + maxY) * 0.5f
 
-        // Re-seed closed loop at the point farthest from centroid (guaranteed true vertex on polygons)
         val loop = if (hypot(pts.last().x - pts.first().x, pts.last().y - pts.first().y) < 4f * density) {
             pts.dropLast(1)
         } else {
@@ -409,19 +680,16 @@ object ShapeRecognizer {
         }
         orderedLoop.add(orderedLoop.first())
 
-        // Extract candidate polygon corners via RDP + collinear angle pruning
         val rdpEps = max(7f * density, diag * 0.048f)
         val rawCorners = removeDuplicateClosingPoint(rdp(orderedLoop, rdpEps), max(12f * density, diag * 0.07f))
         val corners = pruneCollinearClosedCorners(rawCorners, minTurnDegrees = 25.0, minEdgeLen = diag * 0.11f)
 
-        // Compute Polygon Fit Error (normalized by diag)
         val polyErr = if (corners.size >= 3) {
             meanDistanceToClosedPolygon(loop, corners) / diag
         } else {
             1f
         }
 
-        // Compute Ellipse Fit Error
         val rx = boxW * 0.5f
         val ry = boxH * 0.5f
         var ellipseMeanErr = 1f
@@ -440,7 +708,6 @@ object ShapeRecognizer {
             ellipseMaxErr = mx
         }
 
-        // Check if it's a Star (8..12 vertices alternating outer/inner radius)
         val starCorners = pruneCollinearClosedCorners(
             removeDuplicateClosingPoint(rdp(orderedLoop, max(5f * density, diag * 0.032f)), 8f * density),
             minTurnDegrees = 22.0,
@@ -458,7 +725,6 @@ object ShapeRecognizer {
             }
         }
 
-        // Decide between Polygon (3..6 corners) vs Ellipse/Circle
         val hasSharpPolygonFit = corners.size in 3..6 && polyErr < 0.045f
         val isEllipseBetter = ellipseMeanErr < 0.11f && ellipseMaxErr < 0.26f &&
             (!hasSharpPolygonFit || (corners.size >= 5 && ellipseMeanErr * 0.42f < polyErr))
@@ -477,9 +743,7 @@ object ShapeRecognizer {
                     val snappedTri = regularizeTriangle(corners)
                     return RecognizedShape.Triangle(snappedTri[0], snappedTri[1], snappedTri[2])
                 }
-                4 -> {
-                    return classifyQuadrilateral(corners, minX, maxX, minY, maxY)
-                }
+                4 -> return classifyQuadrilateral(corners, minX, maxX, minY, maxY)
                 5 -> {
                     val verts = maybeRegularizePolygon(corners, centroidX, centroidY, 5)
                     return RecognizedShape.Polygon(verts, "Pentágono")
@@ -491,7 +755,6 @@ object ShapeRecognizer {
             }
         }
 
-        // Secondary check for Circle/Ellipse with slightly looser threshold if polygon didn't match
         if (ellipseMeanErr < 0.145f && ellipseMaxErr < 0.31f) {
             val aspect = min(rx, ry) / max(rx, ry)
             val isCircle = aspect >= 0.84f
@@ -515,21 +778,17 @@ object ShapeRecognizer {
         val cx = (minX + maxX) * 0.5f
         val cy = (minY + maxY) * 0.5f
 
-        // Measure edge angles
-        val edgeAngles = DoubleArray(4)
         var axisAlignedCount = 0
         for (i in 0..3) {
             val a = corners[i]
             val b = corners[(i + 1) % 4]
             val deg = Math.toDegrees(atan2((b.y - a.y).toDouble(), (b.x - a.x).toDouble()))
-            edgeAngles[i] = deg
             val mod90 = abs(((deg % 90.0) + 90.0) % 90.0)
             if (mod90 <= 14.0 || mod90 >= 76.0) {
                 axisAlignedCount++
             }
         }
 
-        // 1. Axis-aligned Rectangle or Square (at least 3 edges near 0°/90°)
         if (axisAlignedCount >= 3) {
             val aspect = min(boxW, boxH) / max(boxW, boxH)
             val isSquare = aspect >= 0.86f
@@ -544,7 +803,6 @@ object ShapeRecognizer {
             )
         }
 
-        // 2. Diamond / Rombo check (vertices near top, right, bottom, left midpoints of bounding box)
         val topMid = PointF(cx, minY)
         val rightMid = PointF(maxX, cy)
         val bottomMid = PointF(cx, maxY)
@@ -558,7 +816,6 @@ object ShapeRecognizer {
             return RecognizedShape.Polygon(targets, "Rombo")
         }
 
-        // 3. Parallelogram vs Trapezoid vs General Quad
         val pair02Parallel = areEdgesParallel(corners[0], corners[1], corners[3], corners[2], toleranceDeg = 15.0)
         val pair13Parallel = areEdgesParallel(corners[1], corners[2], corners[0], corners[3], toleranceDeg = 15.0)
 
@@ -595,11 +852,9 @@ object ShapeRecognizer {
         for (i in 1 until shaftPts.size) {
             shaftLen += hypot(shaftPts[i].x - shaftPts[i - 1].x, shaftPts[i].y - shaftPts[i - 1].y)
         }
-        // Shaft must be reasonably straight
         if (shaftLen > maxDist * 1.18f) return null
         if (maxDistanceToSegment(shaftPts, first, tip) > max(10f * density, maxDist * 0.085f)) return null
 
-        // Tail after tip must represent the arrowhead hook/wings
         val tailPts = pts.subList(tipIdx, pts.size)
         var tailLen = 0f
         var maxTailDistFromTip = 0f
@@ -616,7 +871,7 @@ object ShapeRecognizer {
         val sTip = snappedShaft.second
         val shaftAngle = atan2(sTip.y - sStart.y, sTip.x - sStart.x)
         val headLen = max(14f * density, min(28f * density, maxDist * 0.22f))
-        val wingAngle = 0.52f // ~30 deg
+        val wingAngle = 0.52f
         val leftWing = PointF(
             sTip.x - headLen * cos(shaftAngle - wingAngle),
             sTip.y - headLen * sin(shaftAngle - wingAngle)
@@ -638,7 +893,6 @@ object ShapeRecognizer {
         val corners = pruneCollinearOpenCorners(simplified, minTurnDegrees = 26.0, minEdgeLen = 15f * density)
         if (corners.size !in 3..6) return null
 
-        // Verify that the raw points stay close to the polyline segments
         var errSum = 0f
         var maxErr = 0f
         for (p in pts) {
@@ -655,7 +909,6 @@ object ShapeRecognizer {
             return null
         }
 
-        // Snap segments that are nearly horizontal/vertical/45-deg
         val snapped = ArrayList<PointF>(corners.size)
         snapped.add(corners.first())
         for (i in 1 until corners.size) {
@@ -678,7 +931,6 @@ object ShapeRecognizer {
     ): RecognizedShape.Arc? {
         if (endGap < minSize || pathLen < endGap * 1.12f || pathLen > endGap * 2.3f) return null
 
-        // Check that all points lie predominantly on one side of the chord (single-arch curve)
         val dx = last.x - first.x
         val dy = last.y - first.y
         var posCount = 0
@@ -704,12 +956,10 @@ object ShapeRecognizer {
         val dominance = max(posCount, negCount).toFloat() / totalSigned
         if (dominance < 0.9f) return null
 
-        // Compute quadratic Bezier control point so curve passes through peakPoint at t = 0.5
         val midX = (first.x + last.x) * 0.5f
         val midY = (first.y + last.y) * 0.5f
         val control = PointF(2f * peakPoint.x - midX, 2f * peakPoint.y - midY)
 
-        // Verify fit error against quadratic arc
         val candidate = RecognizedShape.Arc(first, control, last)
         val arcSamples = candidate.samplePoints(max(4f * density, 4f))
         var errSum = 0f
@@ -771,9 +1021,8 @@ object ShapeRecognizer {
         minEdgeLen: Float
     ): List<PointF> {
         if (corners.size <= 3) return corners
-        var current = corners.toMutableList()
+        val current = corners.toMutableList()
 
-        // First merge corners that are too close
         var i = 0
         while (i < current.size && current.size > 3) {
             val a = current[i]
@@ -785,7 +1034,6 @@ object ShapeRecognizer {
             }
         }
 
-        // Next remove vertices where turning angle is < minTurnDegrees
         var changed = true
         while (changed && current.size > 3) {
             changed = false
@@ -858,7 +1106,6 @@ object ShapeRecognizer {
     private fun regularizeTriangle(corners: List<PointF>): List<PointF> {
         if (corners.size != 3) return corners
         val out = corners.map { PointF(it.x, it.y) }.toMutableList()
-        // If any edge is within 7 degrees of horizontal or vertical, level that edge
         for (i in 0..2) {
             val a = out[i]
             val b = out[(i + 1) % 3]
@@ -889,9 +1136,7 @@ object ShapeRecognizer {
         val maxRelDev = radii.maxOf { abs(it - meanR) / meanR }
         if (maxRelDev > 0.22f) return corners
 
-        // Regularize around first vertex angle
         val startAngle = atan2((corners[0].y - cy).toDouble(), (corners[0].x - cx).toDouble())
-        // Determine winding direction
         val cross = (corners[0].x - cx) * (corners[1].y - cy) - (corners[0].y - cy) * (corners[1].x - cx)
         val sign = if (cross >= 0f) 1.0 else -1.0
         return List(n) { i ->
