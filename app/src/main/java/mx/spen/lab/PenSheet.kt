@@ -2560,6 +2560,7 @@ class PenSheet(
         selectedIds.clear()
         dryInk.invalidate()
         emitState()
+        return true
     }
 
     fun clear() {
