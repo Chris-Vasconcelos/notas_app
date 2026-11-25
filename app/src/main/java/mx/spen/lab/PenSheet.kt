@@ -11,6 +11,7 @@ import android.graphics.PointF
 import android.graphics.RectF
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.util.TypedValue
 import android.view.MotionEvent
@@ -41,7 +42,7 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
-/** Keeps high-frequency stylus input, world-normalized strokes, zoom/pan, shapes, and lasso outside Compose state. */
+/** Keeps high-frequency stylus input, world-normalized strokes, zoom/pan, shapes, tape, laser, and lasso outside Compose state. */
 class PenSheet(
     context: Context,
     private val onStateChanged: (canUndo: Boolean, canRedo: Boolean, hasSelection: Boolean) -> Unit,
@@ -50,13 +51,16 @@ class PenSheet(
 
     companion object {
         private const val TAG = "PenSheet"
+        private const val LASER_FADE_MS = 1500L
     }
 
     sealed interface CanvasItem {
         val id: Long
         val worldBounds: RectF
         val isHighlighter: Boolean
+        val isTape: Boolean
         fun translated(dx: Float, dy: Float, newId: Long = id): CanvasItem
+        fun recolored(newColor: Int): CanvasItem
     }
 
     data class DebugRawStroke(
@@ -74,6 +78,8 @@ class PenSheet(
         override val isHighlighter: Boolean,
         val debugRaw: DebugRawStroke? = null
     ) : CanvasItem {
+        override val isTape: Boolean get() = data.brushType == BrushType.TAPE
+
         override fun translated(dx: Float, dy: Float, newId: Long): InkItem {
             val movedData = data.translated(dx, dy)
             val movedStroke = buildStrokeFromData(movedData)
@@ -88,6 +94,12 @@ class PenSheet(
             )
         }
 
+        override fun recolored(newColor: Int): InkItem {
+            val newData = data.copy(color = newColor)
+            val newStroke = stroke.copy(stroke.brush.copyWithColorIntArgb(newColor))
+            return copy(data = newData, stroke = newStroke, debugRaw = null)
+        }
+
         override fun equals(other: Any?): Boolean = (other is InkItem) && other.id == id
         override fun hashCode(): Int = id.hashCode()
     }
@@ -100,6 +112,8 @@ class PenSheet(
         override val worldBounds: RectF,
         override val isHighlighter: Boolean
     ) : CanvasItem {
+        override val isTape: Boolean get() = false
+
         override fun translated(dx: Float, dy: Float, newId: Long): ShapeItem {
             val movedShape = shape.translated(dx, dy)
             return ShapeItem(
@@ -112,9 +126,17 @@ class PenSheet(
             )
         }
 
+        override fun recolored(newColor: Int): ShapeItem = copy(color = newColor)
+
         override fun equals(other: Any?): Boolean = (other is ShapeItem) && other.id == id
         override fun hashCode(): Int = id.hashCode()
     }
+
+    private data class LaserTrail(
+        val points: MutableList<PointF> = mutableListOf(),
+        var lastPointMs: Long = SystemClock.uptimeMillis(),
+        val color: Int = 0xFFFF1744.toInt()
+    )
 
     private val isDebugBuild =
         (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
@@ -130,7 +152,12 @@ class PenSheet(
     private val redoHistory = ArrayDeque<List<CanvasItem>>()
     private val erasedIds = mutableSetOf<Long>()
     private val selectedIds = mutableSetOf<Long>()
+    private val revealedTapeIds = mutableSetOf<Long>()
     private val waitingForInk = mutableMapOf<InProgressStrokeId, PendingStrokeMeta>()
+
+    // Laser pointer trails (ephemeral)
+    private var activeLaserTrail: LaserTrail? = null
+    private val laserTrails = mutableListOf<LaserTrail>()
 
     private data class PendingStrokeMeta(
         val scale: Float,
@@ -173,13 +200,21 @@ class PenSheet(
     private var holdSnappedShape: RecognizedShape? = null
     private val holdRunnable = Runnable { trySnapHoldShape() }
 
-    // Zoom & Pan (2-finger)
+    // Zoom & Pan (2-finger) & Multi-finger Tap Undo/Redo gestures
     private var viewScale = 1f
     private var panX = 0f
     private var panY = 0f
     private var isTwoFingerGesturing = false
     private var lastMidX = 0f
     private var lastMidY = 0f
+    private var gestureStartMs = 0L
+    private var gestureMaxFingers = 0
+    private var gestureMaxMovePx = 0f
+    private var gestureStartX = 0f
+    private var gestureStartY = 0f
+    private var singleFingerStartX = 0f
+    private var singleFingerStartY = 0f
+    private var singleFingerMoved = false
 
     private val scaleDetector = ScaleGestureDetector(
         context,
@@ -227,10 +262,36 @@ class PenSheet(
             diagnostics.invalidate()
         }
 
+    var tapeColor: Int = EditorPalettes.tapeColors.first().argb
+        set(value) {
+            field = value
+            diagnostics.invalidate()
+        }
+
     var penWidthDp: Float = 4.2f
     var highlighterWidthDp: Float = 18f
+    var tapeWidthDp: Float = 22f
     var eraserRadiusDp: Float = 12f
     var autoShapeEnabled: Boolean = false
+
+    // Advanced Notein-inspired settings
+    var readingMode: Boolean = false
+        set(value) {
+            field = value
+            if (value && selectedIds.isNotEmpty()) clearSelection()
+            diagnostics.invalidate()
+        }
+
+    var allowFingerDrawing: Boolean = false
+    var adaptiveStrokeWidth: Boolean = true
+    var gestureTapUndoRedo: Boolean = true
+    var pressureEraserEnabled: Boolean = false
+    var pressureEraserThreshold: Float = 0.78f
+    var revealAllTapes: Boolean = false
+        set(value) {
+            field = value
+            dryInk.invalidate()
+        }
 
     var paperStyle: PaperStyle = PaperStyle.LIGHT
         set(value) {
@@ -281,6 +342,11 @@ class PenSheet(
         color = Color.rgb(42, 161, 183)
         pathEffect = DashPathEffect(floatArrayOf(12f, 8f), 0f)
     }
+    private val laserPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
 
     val isWriting: Boolean get() = activePointer != -1 || waitingForInk.isNotEmpty()
 
@@ -309,13 +375,25 @@ class PenSheet(
 
             // Pass 1: Highlighter strokes & shapes behind opaque ink
             for (item in items) {
-                if (item.id !in erasedIds && item.isHighlighter && isItemVisible(item, visibleWorldRect, itemCheckRect)) {
+                if (item.id !in erasedIds && item.isHighlighter && !item.isTape &&
+                    isItemVisible(item, visibleWorldRect, itemCheckRect)
+                ) {
                     drawCanvasItem(canvas, item)
                 }
             }
             // Pass 2: Opaque pen strokes & geometric shapes
             for (item in items) {
-                if (item.id !in erasedIds && !item.isHighlighter && isItemVisible(item, visibleWorldRect, itemCheckRect)) {
+                if (item.id !in erasedIds && !item.isHighlighter && !item.isTape &&
+                    isItemVisible(item, visibleWorldRect, itemCheckRect)
+                ) {
+                    drawCanvasItem(canvas, item)
+                }
+            }
+            // Pass 3: Study Tapes (drawn OVER opaque ink to mask formulas/answers; semi-transparent when revealed)
+            for (item in items) {
+                if (item.id !in erasedIds && item.isTape &&
+                    isItemVisible(item, visibleWorldRect, itemCheckRect)
+                ) {
                     drawCanvasItem(canvas, item)
                 }
             }
@@ -352,7 +430,55 @@ class PenSheet(
                 drawShape(canvas, preview)
             }
 
+            // Ephemeral Laser pointer trails
+            drawLaserTrails(canvas)
+
             canvas.restore()
+        }
+    }
+
+    private fun drawLaserTrails(canvas: Canvas) {
+        val now = SystemClock.uptimeMillis()
+        var needsNextFrame = false
+        val iterator = laserTrails.iterator()
+        while (iterator.hasNext()) {
+            val trail = iterator.next()
+            val age = now - trail.lastPointMs
+            if (age >= LASER_FADE_MS && trail !== activeLaserTrail) {
+                iterator.remove()
+                continue
+            }
+            val alphaFactor = if (trail === activeLaserTrail) {
+                1f
+            } else {
+                (1f - age.toFloat() / LASER_FADE_MS).coerceIn(0f, 1f)
+            }
+            if (trail.points.size >= 2) {
+                val path = Path().apply {
+                    moveTo(trail.points[0].x, trail.points[0].y)
+                    for (i in 1 until trail.points.size) {
+                        lineTo(trail.points[i].x, trail.points[i].y)
+                    }
+                }
+                // Outer neon halo
+                laserPaint.color = Color.argb(
+                    (110 * alphaFactor).toInt(),
+                    Color.red(trail.color),
+                    Color.green(trail.color),
+                    Color.blue(trail.color)
+                )
+                laserPaint.strokeWidth = (12f * density) / viewScale
+                canvas.drawPath(path, laserPaint)
+
+                // Inner bright core
+                laserPaint.color = Color.argb((245 * alphaFactor).toInt(), 255, 240, 245)
+                laserPaint.strokeWidth = (3.5f * density) / viewScale
+                canvas.drawPath(path, laserPaint)
+                needsNextFrame = true
+            }
+        }
+        if (needsNextFrame) {
+            dryInk.postInvalidateOnAnimation()
         }
     }
 
@@ -449,7 +575,21 @@ class PenSheet(
 
         when (item) {
             is InkItem -> {
-                if (debugCompareNormalized && item.debugRaw != null) {
+                if (item.isTape) {
+                    val isRevealed = revealAllTapes || item.id in revealedTapeIds
+                    val tapeStroke = if (isRevealed) {
+                        val ghostColor = (item.data.color and 0x00FFFFFF) or 0x38000000
+                        item.stroke.copy(item.stroke.brush.copyWithColorIntArgb(ghostColor))
+                    } else {
+                        item.stroke
+                    }
+                    renderInk.draw(canvas, tapeStroke, AffineTransform.IDENTITY)
+                    if (isRevealed) {
+                        lassoPaint.color = item.data.color
+                        lassoPaint.strokeWidth = 1.5f * density / viewScale
+                        canvas.drawRoundRect(item.worldBounds, 6f / viewScale, 6f / viewScale, lassoPaint)
+                    }
+                } else if (debugCompareNormalized && item.debugRaw != null) {
                     val raw = item.debugRaw
                     canvas.save()
                     canvas.scale(1f / raw.creationScale, 1f / raw.creationScale)
@@ -586,11 +726,13 @@ class PenSheet(
                 )
             }
 
-            if (hovering || erasing) {
+            if ((hovering || erasing) && !readingMode) {
                 val isErasingCursor = sideButtonPressed || erasing || toolMode == ToolMode.ERASER
                 paint.color = when {
                     isErasingCursor -> Color.rgb(200, 72, 84)
                     toolMode == ToolMode.HIGHLIGHTER -> highlighterColor
+                    toolMode == ToolMode.TAPE -> tapeColor
+                    toolMode == ToolMode.LASER -> Color.rgb(255, 23, 68)
                     toolMode == ToolMode.LASSO -> Color.rgb(42, 161, 183)
                     else -> inkColor
                 }
@@ -599,7 +741,8 @@ class PenSheet(
                 val cursorRadius = when {
                     isErasingCursor -> eraserRadiusDp * density
                     toolMode == ToolMode.HIGHLIGHTER -> (highlighterWidthDp * density) / 2f
-                    toolMode == ToolMode.LASSO -> 6f * density
+                    toolMode == ToolMode.TAPE -> (tapeWidthDp * density) / 2f
+                    toolMode == ToolMode.LASSO || toolMode == ToolMode.LASER -> 6f * density
                     else -> (penWidthDp * density) / 2f
                 }
                 canvas.drawCircle(x, y, max(3f * density, cursorRadius), paint)
@@ -625,7 +768,7 @@ class PenSheet(
                     rememberBeforeChange()
                     val itemId = allocateId()
                     val shape = meta.snappedShape
-                    if (shape != null) {
+                    if (shape != null && meta.brushType != BrushType.TAPE) {
                         items.add(
                             ShapeItem(
                                 id = itemId,
@@ -654,19 +797,32 @@ class PenSheet(
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val index = event.actionIndex
 
-        // Two-finger zoom & pan when stylus is not actively drawing
-        if (activePointer == -1 && event.pointerCount == 2 && !isPen(event, 0) && !isPen(event, 1)) {
-            scaleDetector.onTouchEvent(event)
+        // Multi-finger gesture handling (2-finger zoom/pan + 2-finger tap Undo / 3-finger tap Redo)
+        if (activePointer == -1 && event.pointerCount >= 2 && !isPen(event, 0) && !isPen(event, 1)) {
+            if (event.pointerCount == 2) {
+                scaleDetector.onTouchEvent(event)
+            }
             val midX = (event.getX(0) + event.getX(1)) * 0.5f
             val midY = (event.getY(0) + event.getY(1)) * 0.5f
             when (event.actionMasked) {
                 MotionEvent.ACTION_POINTER_DOWN -> {
-                    isTwoFingerGesturing = true
+                    if (!isTwoFingerGesturing) {
+                        isTwoFingerGesturing = true
+                        gestureStartMs = SystemClock.uptimeMillis()
+                        gestureMaxFingers = event.pointerCount
+                        gestureMaxMovePx = 0f
+                        gestureStartX = midX
+                        gestureStartY = midY
+                    } else {
+                        gestureMaxFingers = max(gestureMaxFingers, event.pointerCount)
+                    }
                     lastMidX = midX
                     lastMidY = midY
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    if (isTwoFingerGesturing) {
+                    if (isTwoFingerGesturing && event.pointerCount == 2) {
+                        val moveDist = hypot(midX - gestureStartX, midY - gestureStartY)
+                        if (moveDist > gestureMaxMovePx) gestureMaxMovePx = moveDist
                         panX += midX - lastMidX
                         panY += midY - lastMidY
                         lastMidX = midX
@@ -675,16 +831,65 @@ class PenSheet(
                         emitTelemetry()
                     }
                 }
-                MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    isTwoFingerGesturing = false
-                }
             }
             return true
         }
 
         if (isTwoFingerGesturing) {
             if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
+                val elapsed = SystemClock.uptimeMillis() - gestureStartMs
+                if (event.actionMasked == MotionEvent.ACTION_UP &&
+                    gestureTapUndoRedo &&
+                    elapsed <= 260L &&
+                    gestureMaxMovePx <= 16f * density
+                ) {
+                    if (gestureMaxFingers == 2) {
+                        undo()
+                    } else if (gestureMaxFingers >= 3) {
+                        redo()
+                    }
+                }
                 isTwoFingerGesturing = false
+                gestureMaxFingers = 0
+            }
+            return true
+        }
+
+        // Reading mode or non-drawing finger touch: pan with 1 finger or tap Study Tape to reveal/hide
+        val isStylusOrAllowedFinger = isPen(event, index) || (allowFingerDrawing && !readingMode)
+        if (readingMode || (!isStylusOrAllowedFinger && activePointer == -1)) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    if (event.getToolType(index) == MotionEvent.TOOL_TYPE_FINGER) {
+                        fingerContacts++
+                        emitTelemetry()
+                    }
+                    singleFingerStartX = event.getX(index)
+                    singleFingerStartY = event.getY(index)
+                    singleFingerMoved = false
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val cx = event.getX(0)
+                    val cy = event.getY(0)
+                    val dx = cx - singleFingerStartX
+                    val dy = cy - singleFingerStartY
+                    if (readingMode && (singleFingerMoved || hypot(dx, dy) > 8f * density)) {
+                        singleFingerMoved = true
+                        panX += dx
+                        panY += dy
+                        singleFingerStartX = cx
+                        singleFingerStartY = cy
+                        dryInk.invalidate()
+                        emitTelemetry()
+                    } else if (hypot(dx, dy) > 12f * density) {
+                        singleFingerMoved = true
+                    }
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!singleFingerMoved) {
+                        toggleTapeAtScreen(event.getX(index), event.getY(index))
+                    }
+                }
             }
             return true
         }
@@ -697,7 +902,9 @@ class PenSheet(
                     fingerContacts++
                     emitTelemetry()
                 }
-                if (activePointer == -1 && isPen(event, index)) beginPen(event, index)
+                if (activePointer == -1 && (isPen(event, index) || allowFingerDrawing)) {
+                    beginPen(event, index)
+                }
             }
             MotionEvent.ACTION_MOVE -> {
                 val penIndex = event.findPointerIndex(activePointer)
@@ -720,6 +927,7 @@ class PenSheet(
                     waitingForInk.remove(id)
                     wetInk.cancelStroke(id, event)
                 }
+                activeLaserTrail = null
                 isDraggingSelection = false
                 selectionDragLastWorld = null
                 dragDx = 0f
@@ -776,11 +984,25 @@ class PenSheet(
         holdSnappedShape = null
         rawWorldPoints.clear()
 
-        val hardwareEraser = sideButtonPressed || event.getToolType(index) == MotionEvent.TOOL_TYPE_ERASER
+        val hardwareEraser = sideButtonPressed ||
+            event.getToolType(index) == MotionEvent.TOOL_TYPE_ERASER ||
+            (pressureEraserEnabled && pressure >= pressureEraserThreshold)
         erasing = hardwareEraser || toolMode == ToolMode.ERASER
 
         if (erasing) {
             eraseAtScreen(x, y)
+            return
+        }
+
+        if (toolMode == ToolMode.LASER) {
+            val trail = LaserTrail(
+                points = mutableListOf(PointF(screenToWorldX(x), screenToWorldY(y))),
+                lastPointMs = SystemClock.uptimeMillis(),
+                color = 0xFFFF1744.toInt()
+            )
+            activeLaserTrail = trail
+            laserTrails.add(trail)
+            dryInk.postInvalidateOnAnimation()
             return
         }
 
@@ -810,9 +1032,29 @@ class PenSheet(
         val capturedPanX = panX
         val capturedPanY = panY
         val isHighlighter = toolMode == ToolMode.HIGHLIGHTER
-        val brushType = if (isHighlighter) BrushType.HIGHLIGHTER else BrushType.PEN
-        val activeColor = if (isHighlighter) highlighterColor else inkColor
-        val sizePx = (if (isHighlighter) highlighterWidthDp else penWidthDp) * density
+        val isTape = toolMode == ToolMode.TAPE
+        val brushType = when (toolMode) {
+            ToolMode.HIGHLIGHTER -> BrushType.HIGHLIGHTER
+            ToolMode.BALLPOINT -> BrushType.BALLPOINT
+            ToolMode.DASHED -> BrushType.DASHED
+            ToolMode.TAPE -> BrushType.TAPE
+            else -> BrushType.PEN
+        }
+        val activeColor = when {
+            isHighlighter -> highlighterColor
+            isTape -> tapeColor
+            else -> inkColor
+        }
+        val baseWidthDp = when {
+            isHighlighter -> highlighterWidthDp
+            isTape -> tapeWidthDp
+            else -> penWidthDp
+        }
+        val sizePx = if (adaptiveStrokeWidth) {
+            baseWidthDp * density
+        } else {
+            baseWidthDp * density * capturedScale
+        }
         val epsilonPx = density / 5f
         val brush = Brush.createWithColorIntArgb(familyFor(brushType), activeColor, sizePx, epsilonPx)
 
@@ -835,7 +1077,9 @@ class PenSheet(
         }
 
         rawWorldPoints.add(PointF((x - capturedPanX) / capturedScale, (y - capturedPanY) / capturedScale))
-        scheduleHoldCheck(x, y)
+        if (!isTape) {
+            scheduleHoldCheck(x, y)
+        }
     }
 
     private fun movePen(event: MotionEvent, index: Int) {
@@ -845,6 +1089,22 @@ class PenSheet(
                 eraseAtScreen(event.getHistoricalX(index, h), event.getHistoricalY(index, h))
             }
             eraseAtScreen(x, y)
+            return
+        }
+
+        if (toolMode == ToolMode.LASER) {
+            val trail = activeLaserTrail ?: return
+            for (h in 0 until event.historySize) {
+                trail.points.add(
+                    PointF(
+                        screenToWorldX(event.getHistoricalX(index, h)),
+                        screenToWorldY(event.getHistoricalY(index, h))
+                    )
+                )
+            }
+            trail.points.add(PointF(screenToWorldX(x), screenToWorldY(y)))
+            trail.lastPointMs = SystemClock.uptimeMillis()
+            dryInk.postInvalidateOnAnimation()
             return
         }
 
@@ -881,7 +1141,7 @@ class PenSheet(
         }
         rawWorldPoints.add(PointF((x - sPanX) / sScale, (y - sPanY) / sScale))
 
-        if (hypot(x - holdAnchorX, y - holdAnchorY) > 6f * density) {
+        if (toolMode != ToolMode.TAPE && hypot(x - holdAnchorX, y - holdAnchorY) > 6f * density) {
             if (holdSnappedShape != null) {
                 holdSnappedShape = null
                 dryInk.postInvalidateOnAnimation()
@@ -906,6 +1166,7 @@ class PenSheet(
                 waitingForInk.remove(id)
                 wetInk.cancelStroke(id, event)
             }
+            activeLaserTrail = null
             lassoPathWorld.clear()
             isDraggingSelection = false
             selectionDragLastWorld = null
@@ -917,8 +1178,13 @@ class PenSheet(
                 rememberBeforeChange()
                 items.removeAll { it.id in erasedIds }
                 selectedIds.removeAll(erasedIds)
+                revealedTapeIds.removeAll(erasedIds)
                 emitState()
             }
+        } else if (toolMode == ToolMode.LASER) {
+            activeLaserTrail?.lastPointMs = SystemClock.uptimeMillis()
+            activeLaserTrail = null
+            dryInk.postInvalidateOnAnimation()
         } else if (toolMode == ToolMode.LASSO) {
             if (isDraggingSelection) {
                 if (hypot(dragDx, dragDy) > 0.01f) {
@@ -936,11 +1202,30 @@ class PenSheet(
             dryInk.invalidate()
             emitState()
         } else {
+            // If user tapped a Study Tape with the stylus while in Tape mode (very short tap), toggle reveal
+            if (toolMode == ToolMode.TAPE && rawWorldPoints.size <= 4) {
+                val first = rawWorldPoints.firstOrNull()
+                val last = rawWorldPoints.lastOrNull()
+                if (first != null && last != null && hypot(last.x - first.x, last.y - first.y) < 6f * density / viewScale) {
+                    if (toggleTapeAtScreen(x, y)) {
+                        activeInk?.let { id ->
+                            waitingForInk.remove(id)
+                            wetInk.cancelStroke(id, event)
+                        }
+                        endPen()
+                        return
+                    }
+                }
+            }
             activeInk?.let { strokeId ->
                 val existing = waitingForInk[strokeId]
                 if (existing != null) {
-                    val finalShape = holdSnappedShape
-                        ?: if (autoShapeEnabled) ShapeRecognizer.recognize(rawWorldPoints, density / existing.scale) else null
+                    val finalShape = if (existing.brushType == BrushType.TAPE) {
+                        null
+                    } else {
+                        holdSnappedShape
+                            ?: if (autoShapeEnabled) ShapeRecognizer.recognize(rawWorldPoints, density / existing.scale) else null
+                    }
                     waitingForInk[strokeId] = existing.copy(snappedShape = finalShape)
                 } else {
                     Log.e(TAG, "finishPen: missing PendingStrokeMeta for $strokeId")
@@ -967,6 +1252,33 @@ class PenSheet(
         }
     }
 
+    private fun toggleTapeAtScreen(sx: Float, sy: Float): Boolean {
+        val wx = screenToWorldX(sx)
+        val wy = screenToWorldY(sy)
+        val hitRadius = (10f * density) / viewScale
+        for (i in items.indices.reversed()) {
+            val item = items[i]
+            if (!item.isTape || item !is InkItem) continue
+            val b = item.worldBounds
+            if (wx < b.left - hitRadius || wx > b.right + hitRadius ||
+                wy < b.top - hitRadius || wy > b.bottom + hitRadius
+            ) {
+                continue
+            }
+            val area = ImmutableBox.fromCenterAndDimensions(
+                ImmutableVec(wx, wy), 2f * hitRadius, 2f * hitRadius
+            )
+            if (area.intersects(item.stroke.shape, AffineTransform.IDENTITY)) {
+                if (!revealedTapeIds.add(item.id)) {
+                    revealedTapeIds.remove(item.id)
+                }
+                dryInk.invalidate()
+                return true
+            }
+        }
+        return false
+    }
+
     private fun scheduleHoldCheck(sx: Float, sy: Float) {
         holdAnchorX = sx
         holdAnchorY = sy
@@ -976,7 +1288,7 @@ class PenSheet(
 
     private fun trySnapHoldShape() {
         val strokeId = activeInk ?: return
-        if (erasing || toolMode == ToolMode.LASSO) return
+        if (erasing || toolMode == ToolMode.LASSO || toolMode == ToolMode.TAPE || toolMode == ToolMode.LASER) return
         val scale = waitingForInk[strokeId]?.scale ?: viewScale
         val recognized = ShapeRecognizer.recognize(rawWorldPoints, density / scale)
         if (recognized != null) {
@@ -1086,10 +1398,24 @@ class PenSheet(
         }
     }
 
+    fun recolorSelection(newColor: Int) {
+        if (isWriting || selectedIds.isEmpty()) return
+        rememberBeforeChange()
+        for (i in items.indices) {
+            val item = items[i]
+            if (item.id in selectedIds) {
+                items[i] = item.recolored(newColor)
+            }
+        }
+        dryInk.invalidate()
+        emitState()
+    }
+
     fun deleteSelection() {
         if (isWriting || selectedIds.isEmpty()) return
         rememberBeforeChange()
         items.removeAll { it.id in selectedIds }
+        revealedTapeIds.removeAll(selectedIds)
         selectedIds.clear()
         dryInk.invalidate()
         emitState()
@@ -1228,6 +1554,7 @@ class PenSheet(
         rememberBeforeChange()
         items.clear()
         selectedIds.clear()
+        revealedTapeIds.clear()
         dryInk.invalidate()
         emitState()
     }
@@ -1347,6 +1674,9 @@ private fun familyFor(type: BrushType): BrushFamily = when (type) {
     BrushType.PEN -> StockBrushes.pressurePen()
     BrushType.PENCIL -> StockBrushes.marker()
     BrushType.HIGHLIGHTER -> StockBrushes.pressurePen()
+    BrushType.BALLPOINT -> StockBrushes.marker()
+    BrushType.DASHED -> StockBrushes.dashedLine()
+    BrushType.TAPE -> StockBrushes.marker()
 }
 
 internal fun buildStrokeFromData(data: StrokeData): Stroke {

@@ -17,8 +17,8 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -51,15 +52,18 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import java.util.Locale
@@ -77,14 +81,33 @@ class MainActivity : ComponentActivity() {
 
     // Editor state
     private var activeTool by mutableStateOf(ToolMode.PEN)
+    private var selectedColorSetIdx by mutableIntStateOf(0) // Clásicos
     private var selectedPenColorIdx by mutableIntStateOf(1) // Marino
     private var selectedHighlighterIdx by mutableIntStateOf(0) // Amarillo
+    private var selectedTapeIdx by mutableIntStateOf(0) // Menta
     private var penWidthDp by mutableFloatStateOf(4.2f)
     private var highlighterWidthDp by mutableFloatStateOf(18f)
+    private var tapeWidthDp by mutableFloatStateOf(22f)
     private var eraserRadiusDp by mutableFloatStateOf(12f)
     private var autoShapeEnabled by mutableStateOf(false)
     private var paperStyle by mutableStateOf(PaperStyle.LIGHT)
     private var paperTemplate by mutableStateOf(PaperTemplate.GRID)
+
+    // Notein-inspired advanced settings
+    private var readingMode by mutableStateOf(false)
+    private var revealAllTapes by mutableStateOf(false)
+    private var gestureTapUndoRedo by mutableStateOf(true)
+    private var adaptiveStrokeWidth by mutableStateOf(true)
+    private var allowFingerDrawing by mutableStateOf(false)
+    private var pressureEraserEnabled by mutableStateOf(false)
+    private var pressureEraserThreshold by mutableFloatStateOf(0.78f)
+
+    // Favorite presets in the movable pencil box
+    private val favoritePresets = mutableStateListOf(
+        PenPreset(ToolMode.PEN, EditorPalettes.basicColors[1].argb, 4.2f),
+        PenPreset(ToolMode.BALLPOINT, EditorPalettes.basicColors[4].argb, 3.0f),
+        PenPreset(ToolMode.HIGHLIGHTER, EditorPalettes.highlighterColors[0].argb, 18f)
+    )
 
     // History & selection state
     private var canUndo by mutableStateOf(false)
@@ -95,6 +118,7 @@ class MainActivity : ComponentActivity() {
     private var focusMode by mutableStateOf(false)
     private var showStrokePanel by mutableStateOf(false)
     private var showPaperDialog by mutableStateOf(false)
+    private var showToolSettingsDialog by mutableStateOf(false)
     private var showDiagnosticsDialog by mutableStateOf(false)
     private var showHelpDialog by mutableStateOf(false)
     private var confirmClear by mutableStateOf(false)
@@ -105,6 +129,7 @@ class MainActivity : ComponentActivity() {
     private var telemetry by mutableStateOf(PenTelemetry())
     private var remoteCount by mutableIntStateOf(0)
     private var remoteStatus by mutableStateOf("En espera de acciones")
+    private var canvasSize by mutableStateOf(IntSize.Zero)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -133,6 +158,12 @@ class MainActivity : ComponentActivity() {
                     TopEditorBar(
                         title = appTitle,
                         zoomPercent = telemetry.zoomPercent,
+                        readingMode = readingMode,
+                        onToggleReadingMode = {
+                            readingMode = !readingMode
+                            sheet?.readingMode = readingMode
+                            if (readingMode) showStrokePanel = false
+                        },
                         focusMode = focusMode,
                         onToggleFocus = {
                             if (sheet?.isWriting != true) {
@@ -142,10 +173,16 @@ class MainActivity : ComponentActivity() {
                         },
                         canUndo = canUndo,
                         canRedo = canRedo,
+                        revealAllTapes = revealAllTapes,
+                        onToggleRevealTapes = {
+                            revealAllTapes = !revealAllTapes
+                            sheet?.revealAllTapes = revealAllTapes
+                        },
                         onFitContent = { sheet?.fitToContent() },
                         onUndo = { sheet?.undo() },
                         onRedo = { sheet?.redo() },
                         onOpenPaper = { showPaperDialog = true },
+                        onOpenToolSettings = { showToolSettingsDialog = true },
                         onOpenDiagnostics = { showDiagnosticsDialog = true },
                         onExportPng = { exportAndSharePng() },
                         canClear = canUndo,
@@ -156,6 +193,7 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxWidth()
+                            .onSizeChanged { canvasSize = it }
                     ) {
                         AndroidView(
                             factory = { context ->
@@ -198,12 +236,12 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
-                        // Floating lasso action bar
-                        androidx.compose.animation.AnimatedVisibility(
+                        // Floating lasso action bar (with 1-tap recolor swatches)
+                        AnimatedVisibility(
                             visible = hasSelection,
                             modifier = Modifier
-                                .align(Alignment.BottomCenter)
-                                .padding(bottom = 12.dp)
+                                .align(Alignment.TopCenter)
+                                .padding(top = 12.dp)
                         ) {
                             Surface(
                                 color = GraphiteSurface.copy(alpha = 0.96f),
@@ -211,90 +249,151 @@ class MainActivity : ComponentActivity() {
                                 border = BorderStroke(1.dp, Petroleum.copy(alpha = 0.6f)),
                                 shadowElevation = 8.dp
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                Column(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
-                                    Text(
-                                        "Selección",
-                                        style = MaterialTheme.typography.labelMedium,
-                                        color = Petroleum,
-                                        modifier = Modifier.padding(horizontal = 6.dp)
-                                    )
-                                    TextButton(onClick = { sheet?.duplicateSelection() }) {
-                                        Text("Duplicar")
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Text(
+                                            "Selección",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = Petroleum,
+                                            modifier = Modifier.padding(horizontal = 6.dp)
+                                        )
+                                        TextButton(onClick = { sheet?.duplicateSelection() }) {
+                                            Text("Duplicar")
+                                        }
+                                        TextButton(onClick = { sheet?.deleteSelection() }) {
+                                            Text("Borrar", color = Color(0xFFE06C75))
+                                        }
+                                        TextButton(onClick = { sheet?.clearSelection() }) {
+                                            Text("Listo")
+                                        }
                                     }
-                                    TextButton(onClick = { sheet?.deleteSelection() }) {
-                                        Text("Borrar", color = Color(0xFFE06C75))
-                                    }
-                                    TextButton(onClick = { sheet?.clearSelection() }) {
-                                        Text("Listo")
+                                    Row(
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        modifier = Modifier.padding(bottom = 4.dp)
+                                    ) {
+                                        currentPenPalette().forEach { swatch ->
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(22.dp)
+                                                    .clip(CircleShape)
+                                                    .background(Color(swatch.argb))
+                                                    .border(1.dp, GraphiteBorder, CircleShape)
+                                                    .clickable { sheet?.recolorSelection(swatch.argb) }
+                                            )
+                                        }
                                     }
                                 }
                             }
                         }
 
-                        // Floating color & width panel
-                        androidx.compose.animation.AnimatedVisibility(
+                        // Floating color & width tuning popover
+                        AnimatedVisibility(
                             visible = showStrokePanel,
                             modifier = Modifier
-                                .align(Alignment.BottomCenter)
-                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                                .align(Alignment.TopCenter)
+                                .padding(horizontal = 12.dp, vertical = 12.dp)
                         ) {
                             StrokeConfigPanel(
                                 tool = activeTool,
+                                selectedColorSetIdx = selectedColorSetIdx,
                                 selectedPenIdx = selectedPenColorIdx,
                                 selectedHighlighterIdx = selectedHighlighterIdx,
-                                penWidthDp = penWidthDp,
-                                highlighterWidthDp = highlighterWidthDp,
-                                eraserRadiusDp = eraserRadiusDp,
+                                selectedTapeIdx = selectedTapeIdx,
+                                currentWidthDp = currentToolWidthDp(),
+                                autoShapeEnabled = autoShapeEnabled,
+                                onSelectColorSet = { setIdx ->
+                                    selectedColorSetIdx = setIdx
+                                    selectedPenColorIdx = selectedPenColorIdx.coerceIn(0, currentPenPalette().lastIndex)
+                                    sheet?.inkColor = currentPenPalette()[selectedPenColorIdx].argb
+                                },
                                 onSelectPenColor = { idx ->
                                     selectedPenColorIdx = idx
-                                    sheet?.inkColor = EditorPalettes.penColors[idx].argb
+                                    sheet?.inkColor = currentPenPalette()[idx].argb
                                 },
                                 onSelectHighlighterColor = { idx ->
                                     selectedHighlighterIdx = idx
                                     sheet?.highlighterColor = EditorPalettes.highlighterColors[idx].argb
                                 },
-                                onChangeWidth = { value ->
-                                    when (activeTool) {
-                                        ToolMode.PEN, ToolMode.LASSO -> {
-                                            penWidthDp = value
-                                            sheet?.penWidthDp = value
-                                        }
-                                        ToolMode.HIGHLIGHTER -> {
-                                            highlighterWidthDp = value
-                                            sheet?.highlighterWidthDp = value
-                                        }
-                                        ToolMode.ERASER -> {
-                                            eraserRadiusDp = value
-                                            sheet?.eraserRadiusDp = value
-                                        }
+                                onSelectTapeColor = { idx ->
+                                    selectedTapeIdx = idx
+                                    sheet?.tapeColor = EditorPalettes.tapeColors[idx].argb
+                                },
+                                onChangeWidth = { value -> applyWidthToActiveTool(value) },
+                                onToggleAutoShape = {
+                                    autoShapeEnabled = !autoShapeEnabled
+                                    sheet?.autoShapeEnabled = autoShapeEnabled
+                                },
+                                onSaveFavorite = {
+                                    val preset = PenPreset(
+                                        tool = activeTool,
+                                        colorArgb = currentActiveArgb(),
+                                        widthDp = currentToolWidthDp()
+                                    )
+                                    if (!favoritePresets.contains(preset)) {
+                                        if (favoritePresets.size >= 5) favoritePresets.removeAt(0)
+                                        favoritePresets.add(preset)
+                                        Toast.makeText(
+                                            this@MainActivity,
+                                            "Guardado en el estuche flotante",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
                                     }
                                 },
                                 onClose = { showStrokePanel = false }
                             )
                         }
-                    }
 
-                    if (!focusMode) {
-                        BottomToolBar(
-                            activeTool = activeTool,
-                            activeColor = currentIndicatorColor(),
-                            autoShapeEnabled = autoShapeEnabled,
-                            strokePanelOpen = showStrokePanel,
-                            onSelectTool = { tool ->
-                                activeTool = tool
-                                sheet?.toolMode = tool
-                                if (tool == ToolMode.LASSO) showStrokePanel = false
-                            },
-                            onToggleStrokePanel = { showStrokePanel = !showStrokePanel },
-                            onToggleAutoShape = {
-                                autoShapeEnabled = !autoShapeEnabled
-                                sheet?.autoShapeEnabled = autoShapeEnabled
-                            }
-                        )
+                        // Movable Floating Pencil Box ("笔盒") — moves across the screen, docks vertically or horizontally, or collapses
+                        if (!focusMode && !readingMode) {
+                            MovablePenBox(
+                                containerSize = canvasSize,
+                                activeTool = activeTool,
+                                activeColor = currentIndicatorColor(),
+                                currentWidthDp = currentToolWidthDp(),
+                                autoShapeEnabled = autoShapeEnabled,
+                                strokePanelOpen = showStrokePanel,
+                                favorites = favoritePresets,
+                                onSelectTool = { tool ->
+                                    activeTool = tool
+                                    sheet?.toolMode = tool
+                                    if (tool == ToolMode.LASSO || tool == ToolMode.LASER) {
+                                        showStrokePanel = false
+                                    }
+                                },
+                                onToggleStrokePanel = { showStrokePanel = !showStrokePanel },
+                                onToggleAutoShape = {
+                                    autoShapeEnabled = !autoShapeEnabled
+                                    sheet?.autoShapeEnabled = autoShapeEnabled
+                                },
+                                onQuickWidthSelect = { w -> applyWidthToActiveTool(w) },
+                                onApplyFavorite = { preset ->
+                                    activeTool = preset.tool
+                                    sheet?.toolMode = preset.tool
+                                    applyWidthToActiveTool(preset.widthDp)
+                                    when (preset.tool) {
+                                        ToolMode.HIGHLIGHTER -> {
+                                            val idx = EditorPalettes.highlighterColors.indexOfFirst { it.argb == preset.colorArgb }
+                                            if (idx >= 0) selectedHighlighterIdx = idx
+                                            sheet?.highlighterColor = preset.colorArgb
+                                        }
+                                        ToolMode.TAPE -> {
+                                            val idx = EditorPalettes.tapeColors.indexOfFirst { it.argb == preset.colorArgb }
+                                            if (idx >= 0) selectedTapeIdx = idx
+                                            sheet?.tapeColor = preset.colorArgb
+                                        }
+                                        else -> {
+                                            sheet?.inkColor = preset.colorArgb
+                                        }
+                                    }
+                                }
+                            )
+                        }
                     }
                 }
 
@@ -305,13 +404,13 @@ class MainActivity : ComponentActivity() {
                         onSelectStyle = { style ->
                             paperStyle = style
                             sheet?.paperStyle = style
-                            // Auto-adjust default ink if switching between light and dark paper
+                            val palette = currentPenPalette()
                             if (style.isDark && selectedPenColorIdx in 0..1) {
-                                selectedPenColorIdx = EditorPalettes.penColors.lastIndex // Tiza
-                                sheet?.inkColor = EditorPalettes.penColors[selectedPenColorIdx].argb
-                            } else if (!style.isDark && selectedPenColorIdx == EditorPalettes.penColors.lastIndex) {
-                                selectedPenColorIdx = 1 // Marino
-                                sheet?.inkColor = EditorPalettes.penColors[selectedPenColorIdx].argb
+                                selectedPenColorIdx = palette.lastIndex
+                                sheet?.inkColor = palette[selectedPenColorIdx].argb
+                            } else if (!style.isDark && selectedPenColorIdx == palette.lastIndex) {
+                                selectedPenColorIdx = 1
+                                sheet?.inkColor = palette[selectedPenColorIdx].argb
                             }
                         },
                         onSelectTemplate = { template ->
@@ -319,6 +418,37 @@ class MainActivity : ComponentActivity() {
                             sheet?.paperTemplate = template
                         },
                         onDismiss = { showPaperDialog = false }
+                    )
+                }
+
+                if (showToolSettingsDialog) {
+                    ToolAndGestureSettingsDialog(
+                        gestureTapUndoRedo = gestureTapUndoRedo,
+                        adaptiveStrokeWidth = adaptiveStrokeWidth,
+                        allowFingerDrawing = allowFingerDrawing,
+                        pressureEraserEnabled = pressureEraserEnabled,
+                        pressureEraserThreshold = pressureEraserThreshold,
+                        onChangeGestureUndoRedo = {
+                            gestureTapUndoRedo = it
+                            sheet?.gestureTapUndoRedo = it
+                        },
+                        onChangeAdaptiveStroke = {
+                            adaptiveStrokeWidth = it
+                            sheet?.adaptiveStrokeWidth = it
+                        },
+                        onChangeAllowFinger = {
+                            allowFingerDrawing = it
+                            sheet?.allowFingerDrawing = it
+                        },
+                        onChangePressureEraser = {
+                            pressureEraserEnabled = it
+                            sheet?.pressureEraserEnabled = it
+                        },
+                        onChangePressureThreshold = {
+                            pressureEraserThreshold = it
+                            sheet?.pressureEraserThreshold = it
+                        },
+                        onDismiss = { showToolSettingsDialog = false }
                     )
                 }
 
@@ -352,12 +482,11 @@ class MainActivity : ComponentActivity() {
                         title = { Text("Guía rápida · S Pen Lab") },
                         text = {
                             Text(
-                                "• Escribir: Usa el S Pen; un solo dedo nunca pinta (rechazo de palma).\n" +
-                                    "• Zoom y paneo: Pellizca o arrastra con dos dedos para acercar o moverte.\n" +
-                                    "• Borrador rápido: Mantén el botón lateral del S Pen mientras tocas un trazo.\n" +
-                                    "• Figuras geométricas: Mantén la punta quieta medio segundo al terminar un trazo (línea, flecha, círculo, rectángulo, triángulo), o activa «Formas» en la barra. Si prefieres tu dibujo, toca «Conservar trazo» antes de seguir.\n" +
-                                    "• Lazo: Encierra trazos para moverlos, duplicarlos o borrarlos.\n" +
-                                    "• Air Actions: Clic = deshacer · Gesto → = rotar color."
+                                "• Estuche flotante: Arrástralo desde los puntos de agarre a cualquier parte. Si lo llevas a los bordes laterales se vuelve vertical; con «−» se contrae en una burbuja flotante.\n" +
+                                    "• Opciones del lápiz: Toca de nuevo la herramienta activa o el círculo de color para abrir paletas (Clásicos, Morandi, Intensos), grosores y guardar favoritos (★).\n" +
+                                    "• Cinta de estudio: Tapa fórmulas o definiciones; tócalas con el dedo para revelarlas u ocultarlas al estudiar.\n" +
+                                    "• Puntero láser: Subraya al explicar; el trazo brillante desaparece solo en 1.5 s.\n" +
+                                    "• Gestos: Toque con 2 dedos = Deshacer · Toque con 3 dedos = Rehacer · Pellizcar con 2 dedos = Zoom."
                             )
                         },
                         confirmButton = {
@@ -387,14 +516,60 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun currentPenPalette(): List<InkSwatch> =
+        EditorPalettes.colorSets[selectedColorSetIdx].swatches
+
+    private fun currentToolWidthDp(): Float = when (activeTool) {
+        ToolMode.HIGHLIGHTER -> highlighterWidthDp
+        ToolMode.TAPE -> tapeWidthDp
+        ToolMode.ERASER -> eraserRadiusDp
+        else -> penWidthDp
+    }
+
+    private fun applyWidthToActiveTool(value: Float) {
+        when (activeTool) {
+            ToolMode.HIGHLIGHTER -> {
+                highlighterWidthDp = value
+                sheet?.highlighterWidthDp = value
+            }
+            ToolMode.TAPE -> {
+                tapeWidthDp = value
+                sheet?.tapeWidthDp = value
+            }
+            ToolMode.ERASER -> {
+                eraserRadiusDp = value
+                sheet?.eraserRadiusDp = value
+            }
+            else -> {
+                penWidthDp = value
+                sheet?.penWidthDp = value
+            }
+        }
+    }
+
+    private fun currentActiveArgb(): Int = when (activeTool) {
+        ToolMode.HIGHLIGHTER -> EditorPalettes.highlighterColors[selectedHighlighterIdx].argb
+        ToolMode.TAPE -> EditorPalettes.tapeColors[selectedTapeIdx].argb
+        else -> currentPenPalette()[selectedPenColorIdx].argb
+    }
+
     private fun syncSheetConfig(view: PenSheet) {
         view.toolMode = activeTool
-        view.inkColor = EditorPalettes.penColors[selectedPenColorIdx].argb
+        view.inkColor = currentPenPalette()[selectedPenColorIdx].argb
         view.highlighterColor = EditorPalettes.highlighterColors[selectedHighlighterIdx].argb
+        view.tapeColor = EditorPalettes.tapeColors[selectedTapeIdx].argb
         view.penWidthDp = penWidthDp
         view.highlighterWidthDp = highlighterWidthDp
+        view.tapeWidthDp = tapeWidthDp
         view.eraserRadiusDp = eraserRadiusDp
         view.autoShapeEnabled = autoShapeEnabled
+        view.readingMode = readingMode
+        view.revealAllTapes = revealAllTapes
+        view.gestureTapUndoRedo = gestureTapUndoRedo
+        view.adaptiveStrokeWidth = adaptiveStrokeWidth
+        view.allowFingerDrawing = allowFingerDrawing
+        view.pressureEraserEnabled = pressureEraserEnabled
+        view.pressureEraserThreshold = pressureEraserThreshold
         view.paperStyle = paperStyle
         view.paperTemplate = paperTemplate
         view.showDiagnostics = showHudOverlay
@@ -403,15 +578,18 @@ class MainActivity : ComponentActivity() {
 
     private fun currentIndicatorColor(): Color = when (activeTool) {
         ToolMode.HIGHLIGHTER -> Color(EditorPalettes.highlighterColors[selectedHighlighterIdx].argb)
+        ToolMode.TAPE -> Color(EditorPalettes.tapeColors[selectedTapeIdx].argb)
+        ToolMode.LASER -> Color(0xFFFF1744)
         ToolMode.ERASER -> Color(0xFFE06C75)
         ToolMode.LASSO -> Petroleum
-        ToolMode.PEN -> Color(EditorPalettes.penColors[selectedPenColorIdx].argb)
+        else -> Color(currentPenPalette()[selectedPenColorIdx].argb)
     }
 
     private fun cycleColor() {
         if (sheet?.isWriting == true) return
-        selectedPenColorIdx = (selectedPenColorIdx + 1) % EditorPalettes.penColors.size
-        sheet?.inkColor = EditorPalettes.penColors[selectedPenColorIdx].argb
+        val palette = currentPenPalette()
+        selectedPenColorIdx = (selectedPenColorIdx + 1) % palette.size
+        sheet?.inkColor = palette[selectedPenColorIdx].argb
     }
 
     private fun exportAndSharePng() {
@@ -450,13 +628,13 @@ class MainActivity : ComponentActivity() {
         val view = sheet ?: return true
         remoteCount++
         remoteStatus = when {
-            showHelpDialog || showDiagnosticsDialog || showPaperDialog || confirmClear || view.isWriting ->
+            showHelpDialog || showDiagnosticsDialog || showPaperDialog || showToolSettingsDialog || confirmClear || view.isWriting ->
                 "Comando recibido · editor ocupado"
             event.keyCode == KeyEvent.KEYCODE_F9 ->
                 if (view.undo()) "Clic · último cambio deshecho" else "Clic · nada por deshacer"
             else -> {
                 cycleColor()
-                "Gesto → · color ${EditorPalettes.penColors[selectedPenColorIdx].name}"
+                "Gesto → · color ${currentPenPalette()[selectedPenColorIdx].name}"
             }
         }
         return true
@@ -466,99 +644,133 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun StrokeConfigPanel(
     tool: ToolMode,
+    selectedColorSetIdx: Int,
     selectedPenIdx: Int,
     selectedHighlighterIdx: Int,
-    penWidthDp: Float,
-    highlighterWidthDp: Float,
-    eraserRadiusDp: Float,
+    selectedTapeIdx: Int,
+    currentWidthDp: Float,
+    autoShapeEnabled: Boolean,
+    onSelectColorSet: (Int) -> Unit,
     onSelectPenColor: (Int) -> Unit,
     onSelectHighlighterColor: (Int) -> Unit,
+    onSelectTapeColor: (Int) -> Unit,
     onChangeWidth: (Float) -> Unit,
+    onToggleAutoShape: () -> Unit,
+    onSaveFavorite: () -> Unit,
     onClose: () -> Unit
 ) {
     Surface(
         color = GraphiteSurface.copy(alpha = 0.97f),
-        shape = RoundedCornerShape(16.dp),
+        shape = RoundedCornerShape(18.dp),
         border = BorderStroke(1.dp, GraphiteBorder),
-        shadowElevation = 10.dp,
+        shadowElevation = 12.dp,
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(modifier = Modifier.padding(14.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = when (tool) {
-                        ToolMode.HIGHLIGHTER -> "Color y grosor · Resaltador"
-                        ToolMode.ERASER -> "Radio del borrador"
-                        else -> "Color y grosor · Pluma"
-                    },
+                    text = "Opciones · ${tool.label}",
                     style = MaterialTheme.typography.labelLarge,
                     color = InkTextPrimary,
                     modifier = Modifier.weight(1f)
                 )
+                if (tool != ToolMode.ERASER && tool != ToolMode.LASSO && tool != ToolMode.LASER) {
+                    TextButton(onClick = onSaveFavorite) {
+                        Text("★ Favorito", color = Petroleum)
+                    }
+                }
                 TextButton(onClick = onClose) { Text("Cerrar") }
             }
 
             if (tool != ToolMode.ERASER) {
-                Spacer(Modifier.height(6.dp))
-                val swatches = if (tool == ToolMode.HIGHLIGHTER) {
-                    EditorPalettes.highlighterColors
-                } else {
-                    EditorPalettes.penColors
+                // Color set tabs for Pen / Ballpoint / Dashed
+                if (tool != ToolMode.HIGHLIGHTER && tool != ToolMode.TAPE) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    ) {
+                        EditorPalettes.colorSets.forEachIndexed { idx, set ->
+                            FilterChip(
+                                selected = idx == selectedColorSetIdx,
+                                onClick = { onSelectColorSet(idx) },
+                                label = { Text(set.title) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = PetroleumDeep,
+                                    selectedLabelColor = InkTextPrimary
+                                )
+                            )
+                        }
+                    }
                 }
-                val selectedIdx = if (tool == ToolMode.HIGHLIGHTER) selectedHighlighterIdx else selectedPenIdx
+
+                val swatches = when (tool) {
+                    ToolMode.HIGHLIGHTER -> EditorPalettes.highlighterColors
+                    ToolMode.TAPE -> EditorPalettes.tapeColors
+                    else -> EditorPalettes.colorSets[selectedColorSetIdx].swatches
+                }
+                val selectedIdx = when (tool) {
+                    ToolMode.HIGHLIGHTER -> selectedHighlighterIdx
+                    ToolMode.TAPE -> selectedTapeIdx
+                    else -> selectedPenIdx
+                }
+
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     swatches.forEachIndexed { idx, swatch ->
                         val isSelected = idx == selectedIdx
                         Box(
                             modifier = Modifier
-                                .size(44.dp)
-                                .clip(CircleShape)
-                                .semantics { contentDescription = swatch.name }
+                                .size(40.dp)
                                 .selectable(
                                     selected = isSelected,
                                     role = Role.RadioButton,
                                     onClick = {
-                                        if (tool == ToolMode.HIGHLIGHTER) onSelectHighlighterColor(idx)
-                                        else onSelectPenColor(idx)
+                                        when (tool) {
+                                            ToolMode.HIGHLIGHTER -> onSelectHighlighterColor(idx)
+                                            ToolMode.TAPE -> onSelectTapeColor(idx)
+                                            else -> onSelectPenColor(idx)
+                                        }
                                     }
                                 )
-                                .border(
-                                    width = if (isSelected) 2.dp else 1.dp,
-                                    color = if (isSelected) Petroleum else GraphiteBorder,
-                                    shape = CircleShape
-                                )
-                                .padding(5.dp)
-                                .background(Color(swatch.argb), CircleShape)
-                        )
+                                .semantics { contentDescription = swatch.name },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Box(
+                                Modifier
+                                    .size(30.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(swatch.argb))
+                                    .border(
+                                        width = if (isSelected) 2.5.dp else 1.dp,
+                                        color = if (isSelected) Petroleum else GraphiteBorder,
+                                        shape = CircleShape
+                                    )
+                            )
+                        }
                     }
                 }
             }
 
-            Spacer(Modifier.height(10.dp))
-            val value = when (tool) {
-                ToolMode.HIGHLIGHTER -> highlighterWidthDp
-                ToolMode.ERASER -> eraserRadiusDp
-                else -> penWidthDp
-            }
+            Spacer(Modifier.height(8.dp))
             val range = when (tool) {
                 ToolMode.HIGHLIGHTER -> 10f..32f
+                ToolMode.TAPE -> 14f..36f
                 ToolMode.ERASER -> 6f..28f
-                else -> 2f..12f
+                else -> 1.8f..12f
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = String.format(Locale.getDefault(), "%.1f dp", value),
+                    text = String.format(Locale.getDefault(), "%.1f dp", currentWidthDp),
                     style = MaterialTheme.typography.bodySmall,
                     color = InkTextSecondary,
                     modifier = Modifier.width(56.dp)
                 )
                 Slider(
-                    value = value,
+                    value = currentWidthDp.coerceIn(range.start, range.endInclusive),
                     onValueChange = onChangeWidth,
                     valueRange = range,
                     colors = SliderDefaults.colors(
@@ -569,8 +781,119 @@ private fun StrokeConfigPanel(
                     modifier = Modifier.weight(1f)
                 )
             }
+
+            if (tool == ToolMode.PEN || tool == ToolMode.BALLPOINT || tool == ToolMode.DASHED || tool == ToolMode.HIGHLIGHTER) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        "Trazo a figura automático (o mantener 0.4 s)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = InkTextSecondary,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = autoShapeEnabled,
+                        onCheckedChange = { onToggleAutoShape() },
+                        colors = SwitchDefaults.colors(checkedThumbColor = Petroleum)
+                    )
+                }
+            }
         }
     }
+}
+
+@Composable
+private fun ToolAndGestureSettingsDialog(
+    gestureTapUndoRedo: Boolean,
+    adaptiveStrokeWidth: Boolean,
+    allowFingerDrawing: Boolean,
+    pressureEraserEnabled: Boolean,
+    pressureEraserThreshold: Float,
+    onChangeGestureUndoRedo: (Boolean) -> Unit,
+    onChangeAdaptiveStroke: (Boolean) -> Unit,
+    onChangeAllowFinger: (Boolean) -> Unit,
+    onChangePressureEraser: (Boolean) -> Unit,
+    onChangePressureThreshold: (Float) -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = GraphiteSurface,
+        title = { Text("Ajustes de lápiz, página y gestos") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Toque 2 dedos = Deshacer / 3 dedos = Rehacer", style = MaterialTheme.typography.bodyMedium)
+                        Text("Gesto rápido con los dedos sobre la hoja", style = MaterialTheme.typography.bodySmall, color = InkTextSecondary)
+                    }
+                    Switch(
+                        checked = gestureTapUndoRedo,
+                        onCheckedChange = onChangeGestureUndoRedo,
+                        colors = SwitchDefaults.colors(checkedThumbColor = Petroleum)
+                    )
+                }
+                HorizontalDivider(color = GraphiteBorder)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Grosor de trazo adaptativo", style = MaterialTheme.typography.bodyMedium)
+                        Text("Escala el grosor proporcionalmente al zoom", style = MaterialTheme.typography.bodySmall, color = InkTextSecondary)
+                    }
+                    Switch(
+                        checked = adaptiveStrokeWidth,
+                        onCheckedChange = onChangeAdaptiveStroke,
+                        colors = SwitchDefaults.colors(checkedThumbColor = Petroleum)
+                    )
+                }
+                HorizontalDivider(color = GraphiteBorder)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Cambio rápido S Pen / Dedo", style = MaterialTheme.typography.bodyMedium)
+                        Text("Permitir dibujar también con 1 dedo", style = MaterialTheme.typography.bodySmall, color = InkTextSecondary)
+                    }
+                    Switch(
+                        checked = allowFingerDrawing,
+                        onCheckedChange = onChangeAllowFinger,
+                        colors = SwitchDefaults.colors(checkedThumbColor = Petroleum)
+                    )
+                }
+                HorizontalDivider(color = GraphiteBorder)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Borrador por presión fuerte", style = MaterialTheme.typography.bodyMedium)
+                        Text("Activa el borrador al presionar fuerte el S Pen", style = MaterialTheme.typography.bodySmall, color = InkTextSecondary)
+                    }
+                    Switch(
+                        checked = pressureEraserEnabled,
+                        onCheckedChange = onChangePressureEraser,
+                        colors = SwitchDefaults.colors(checkedThumbColor = Petroleum)
+                    )
+                }
+                if (pressureEraserEnabled) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "Umbral ${(pressureEraserThreshold * 100).toInt()}%",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = InkTextSecondary,
+                            modifier = Modifier.width(82.dp)
+                        )
+                        Slider(
+                            value = pressureEraserThreshold,
+                            onValueChange = onChangePressureThreshold,
+                            valueRange = 0.45f..0.95f,
+                            colors = SliderDefaults.colors(thumbColor = Petroleum, activeTrackColor = Petroleum),
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Listo") }
+        }
+    )
 }
 
 @Composable
