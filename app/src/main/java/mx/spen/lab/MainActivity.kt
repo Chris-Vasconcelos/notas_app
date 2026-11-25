@@ -34,6 +34,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -89,6 +91,7 @@ class MainActivity : ComponentActivity() {
     private var hasSelection by mutableStateOf(false)
 
     // Panels & dialogs
+    private var focusMode by mutableStateOf(false)
     private var showStrokePanel by mutableStateOf(false)
     private var showPaperDialog by mutableStateOf(false)
     private var showDiagnosticsDialog by mutableStateOf(false)
@@ -128,6 +131,13 @@ class MainActivity : ComponentActivity() {
                     TopEditorBar(
                         title = appTitle,
                         zoomPercent = telemetry.zoomPercent,
+                        focusMode = focusMode,
+                        onToggleFocus = {
+                            if (sheet?.isWriting != true) {
+                                showStrokePanel = false
+                                focusMode = !focusMode
+                            }
+                        },
                         canUndo = canUndo,
                         canRedo = canRedo,
                         onFitContent = { sheet?.fitToContent() },
@@ -172,12 +182,15 @@ class MainActivity : ComponentActivity() {
                                     .align(Alignment.TopCenter)
                                     .padding(top = 10.dp)
                             ) {
-                                Text(
-                                    text = "✓ $shapeName",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = InkTextPrimary,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp)
-                                )
+                                Row(
+                                    modifier = Modifier.padding(start = 12.dp, end = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(shapeName, style = MaterialTheme.typography.labelMedium)
+                                    TextButton(onClick = { sheet?.restoreOriginalStroke() }) {
+                                        Text("Conservar trazo")
+                                    }
+                                }
                             }
                         }
 
@@ -261,24 +274,26 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    BottomToolBar(
-                        activeTool = activeTool,
-                        activeColor = currentIndicatorColor(),
-                        autoShapeEnabled = autoShapeEnabled,
-                        hasContent = canUndo,
-                        strokePanelOpen = showStrokePanel,
-                        onSelectTool = { tool ->
-                            activeTool = tool
-                            sheet?.toolMode = tool
-                            if (tool == ToolMode.LASSO) showStrokePanel = false
-                        },
-                        onToggleStrokePanel = { showStrokePanel = !showStrokePanel },
-                        onToggleAutoShape = {
-                            autoShapeEnabled = !autoShapeEnabled
-                            sheet?.autoShapeEnabled = autoShapeEnabled
-                        },
-                        onRequestClear = { confirmClear = true }
-                    )
+                    if (!focusMode) {
+                        BottomToolBar(
+                            activeTool = activeTool,
+                            activeColor = currentIndicatorColor(),
+                            autoShapeEnabled = autoShapeEnabled,
+                            hasContent = canUndo,
+                            strokePanelOpen = showStrokePanel,
+                            onSelectTool = { tool ->
+                                activeTool = tool
+                                sheet?.toolMode = tool
+                                if (tool == ToolMode.LASSO) showStrokePanel = false
+                            },
+                            onToggleStrokePanel = { showStrokePanel = !showStrokePanel },
+                            onToggleAutoShape = {
+                                autoShapeEnabled = !autoShapeEnabled
+                                sheet?.autoShapeEnabled = autoShapeEnabled
+                            },
+                            onRequestClear = { confirmClear = true }
+                        )
+                    }
                 }
 
                 if (showPaperDialog) {
@@ -338,7 +353,7 @@ class MainActivity : ComponentActivity() {
                                 "• Escribir: Usa el S Pen; un solo dedo nunca pinta (rechazo de palma).\n" +
                                     "• Zoom y paneo: Pellizca o arrastra con dos dedos para acercar o moverte.\n" +
                                     "• Borrador rápido: Mantén el botón lateral del S Pen mientras tocas un trazo.\n" +
-                                    "• Figuras geométricas: Mantén la punta quieta medio segundo al terminar un trazo (línea, flecha, círculo, rectángulo, triángulo), o activa «Formas» en la barra.\n" +
+                                    "• Figuras geométricas: Mantén la punta quieta medio segundo al terminar un trazo (línea, flecha, círculo, rectángulo, triángulo), o activa «Formas» en la barra. Si prefieres tu dibujo, toca «Conservar trazo» antes de seguir.\n" +
                                     "• Lazo: Encierra trazos para moverlos, duplicarlos o borrarlos.\n" +
                                     "• Air Actions: Clic = deshacer · Gesto → = rotar color."
                             )
@@ -450,6 +465,8 @@ class MainActivity : ComponentActivity() {
 private fun TopEditorBar(
     title: String,
     zoomPercent: Int,
+    focusMode: Boolean,
+    onToggleFocus: () -> Unit,
     canUndo: Boolean,
     canRedo: Boolean,
     onFitContent: () -> Unit,
@@ -495,14 +512,39 @@ private fun TopEditorBar(
             TextButton(onClick = onRedo, enabled = canRedo) {
                 Text("↷", style = MaterialTheme.typography.titleMedium)
             }
-            TextButton(onClick = onOpenPaper) {
-                Text("Hoja", style = MaterialTheme.typography.labelLarge)
-            }
-            TextButton(onClick = onOpenDiagnostics) {
-                Text("Lab", style = MaterialTheme.typography.labelLarge)
-            }
-            TextButton(onClick = onExportPng) {
-                Text("PNG", style = MaterialTheme.typography.labelLarge, color = Petroleum)
+            EditorMenu(
+                focusMode, onToggleFocus, onOpenPaper, onOpenDiagnostics, onExportPng
+            )
+        }
+    }
+}
+
+@Composable
+private fun EditorMenu(
+    focusMode: Boolean,
+    onToggleFocus: () -> Unit,
+    onOpenPaper: () -> Unit,
+    onOpenDiagnostics: () -> Unit,
+    onExportPng: () -> Unit
+) {
+    var expanded by androidx.compose.runtime.remember { mutableStateOf(false) }
+    Box {
+        TextButton(onClick = { expanded = true }) { Text("Menú") }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            val actions = listOf(
+                (if (focusMode) "Mostrar herramientas" else "Modo enfoque") to onToggleFocus,
+                "Papel y plantilla" to onOpenPaper,
+                "Diagnóstico" to onOpenDiagnostics,
+                "Exportar PNG" to onExportPng
+            )
+            for ((label, action) in actions) {
+                DropdownMenuItem(
+                    text = { Text(label) },
+                    onClick = {
+                        expanded = false
+                        action()
+                    }
+                )
             }
         }
     }

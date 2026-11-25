@@ -161,6 +161,9 @@ class PenSheet(
     private var fingerContacts = 0
     private var cancellations = 0
     private var lastShapeDetected: String? = null
+    private var shapeCorrection: ShapeCorrection? = null
+
+    private data class ShapeCorrection(val id: Long, val rawStroke: Stroke, val meta: PendingStrokeMeta)
 
     // Hold-to-Shape tracking
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -620,43 +623,23 @@ class PenSheet(
                         continue
                     }
                     rememberBeforeChange()
-                    if (meta.snappedShape != null) {
-                        val shapeBounds = meta.snappedShape.computeWorldBounds(meta.sizeWorld)
+                    val itemId = allocateId()
+                    val shape = meta.snappedShape
+                    if (shape != null) {
                         items.add(
                             ShapeItem(
-                                id = allocateId(),
-                                shape = meta.snappedShape,
+                                id = itemId,
+                                shape = shape,
                                 color = meta.color,
                                 strokeWidthWorld = meta.sizeWorld,
-                                worldBounds = shapeBounds,
+                                worldBounds = shape.computeWorldBounds(meta.sizeWorld),
                                 isHighlighter = meta.isHighlighter
                             )
                         )
-                        lastShapeDetected = meta.snappedShape.label
+                        lastShapeDetected = shape.label
+                        shapeCorrection = ShapeCorrection(itemId, rawStroke, meta)
                     } else {
-                        val (strokeData, worldStroke) = normalizeAndRebuildStroke(rawStroke, meta)
-                        val bounds = computeStrokeWorldBounds(worldStroke, strokeData)
-                        val debugRaw = if (isDebugBuild && debugCompareNormalized) {
-                            val redBrush = rawStroke.brush.copyWithColorIntArgb(0xFFFF1744.toInt())
-                            DebugRawStroke(
-                                redStroke = rawStroke.copy(redBrush),
-                                creationScale = meta.scale,
-                                creationPanX = meta.panX,
-                                creationPanY = meta.panY
-                            )
-                        } else {
-                            null
-                        }
-                        items.add(
-                            InkItem(
-                                id = allocateId(),
-                                data = strokeData,
-                                stroke = worldStroke,
-                                worldBounds = bounds,
-                                isHighlighter = meta.isHighlighter,
-                                debugRaw = debugRaw
-                            )
-                        )
+                        items.add(createInkItem(itemId, rawStroke, meta))
                     }
                 }
                 dryInk.invalidate()
@@ -934,6 +917,7 @@ class PenSheet(
                 rememberBeforeChange()
                 items.removeAll { it.id in erasedIds }
                 selectedIds.removeAll(erasedIds)
+                emitState()
             }
         } else if (toolMode == ToolMode.LASSO) {
             if (isDraggingSelection) {
@@ -1188,7 +1172,27 @@ class PenSheet(
         emitTelemetry()
     }
 
+    fun restoreOriginalStroke() {
+        if (isWriting) return
+        val correction = shapeCorrection ?: return
+        val index = items.indexOfLast { it is ShapeItem && it.id == correction.id }
+        if (index < 0) return
+        items[index] = createInkItem(correction.id, correction.rawStroke, correction.meta)
+        redoHistory.clear()
+        clearShapeCorrection()
+        dryInk.invalidate()
+        emitState()
+    }
+
+    private fun clearShapeCorrection() {
+        if (shapeCorrection == null) return
+        shapeCorrection = null
+        lastShapeDetected = null
+        emitTelemetry()
+    }
+
     private fun rememberBeforeChange() {
+        clearShapeCorrection()
         undoHistory.addLast(items.toList())
         if (undoHistory.size > 50) undoHistory.removeFirst()
         redoHistory.clear()
@@ -1197,6 +1201,7 @@ class PenSheet(
 
     fun undo(): Boolean {
         if (isWriting || undoHistory.isEmpty()) return false
+        clearShapeCorrection()
         redoHistory.addLast(items.toList())
         items.clear()
         items.addAll(undoHistory.removeLast())
@@ -1208,6 +1213,7 @@ class PenSheet(
 
     fun redo(): Boolean {
         if (isWriting || redoHistory.isEmpty()) return false
+        clearShapeCorrection()
         undoHistory.addLast(items.toList())
         items.clear()
         items.addAll(redoHistory.removeLast())
@@ -1252,6 +1258,28 @@ class PenSheet(
                 zoomPercent = (viewScale * 100).toInt(),
                 lastShapeDetected = lastShapeDetected
             )
+        )
+    }
+
+    private fun createInkItem(id: Long, rawStroke: Stroke, meta: PendingStrokeMeta): InkItem {
+        val (strokeData, worldStroke) = normalizeAndRebuildStroke(rawStroke, meta)
+        val debugRaw = if (isDebugBuild && debugCompareNormalized) {
+            DebugRawStroke(
+                redStroke = rawStroke.copy(rawStroke.brush.copyWithColorIntArgb(0xFFFF1744.toInt())),
+                creationScale = meta.scale,
+                creationPanX = meta.panX,
+                creationPanY = meta.panY
+            )
+        } else {
+            null
+        }
+        return InkItem(
+            id = id,
+            data = strokeData,
+            stroke = worldStroke,
+            worldBounds = computeStrokeWorldBounds(worldStroke, strokeData),
+            isHighlighter = meta.isHighlighter,
+            debugRaw = debugRaw
         )
     }
 
