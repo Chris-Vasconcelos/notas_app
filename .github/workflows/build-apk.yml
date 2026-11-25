@@ -29,9 +29,12 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build Debug APK
-        run: ./gradlew :app:assembleDebug
+        run: |
+          set -o pipefail
+          ./gradlew :app:assembleDebug --console=plain 2>&1 | tee build.log
 
       - name: Upload APK artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: SPenLab-Debug-APK
@@ -39,9 +42,12 @@ jobs:
           if-no-files-found: error
 
       - name: Publish latest debug APK release
+        if: always()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest-debug
           name: Latest Debug APK
           prerelease: true
-          files: app/build/outputs/apk/debug/app-debug.apk
+          files: |
+            app/build/outputs/apk/debug/app-debug.apk
+            build.log
