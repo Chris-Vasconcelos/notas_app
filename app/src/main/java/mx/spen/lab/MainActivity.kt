@@ -10,14 +10,15 @@ import android.view.KeyEvent
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,8 +35,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -58,18 +57,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import java.util.Locale
 
-private val GraphiteBg = Color(0xFF14161A)
-private val GraphiteSurface = Color(0xFF1D2128)
-private val GraphiteBorder = Color(0xFF2C333F)
-private val Petroleum = Color(0xFF2AA1B7)
+internal val GraphiteBg = Color(0xFF14161A)
+internal val GraphiteSurface = Color(0xFF1D2128)
+internal val GraphiteBorder = Color(0xFF2C333F)
+internal val Petroleum = Color(0xFF2AA1B7)
 private val PetroleumDeep = Color(0xFF165664)
-private val InkTextPrimary = Color(0xFFEDF1F7)
-private val InkTextSecondary = Color(0xFF9AA5B4)
+internal val InkTextPrimary = Color(0xFFEDF1F7)
+internal val InkTextSecondary = Color(0xFF9AA5B4)
 
 class MainActivity : ComponentActivity() {
     private var sheet: PenSheet? = null
@@ -107,7 +108,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        val darkBars = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        enableEdgeToEdge(statusBarStyle = darkBars, navigationBarStyle = darkBars)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val appTitle = getString(applicationInfo.labelRes)
 
@@ -145,7 +147,9 @@ class MainActivity : ComponentActivity() {
                         onRedo = { sheet?.redo() },
                         onOpenPaper = { showPaperDialog = true },
                         onOpenDiagnostics = { showDiagnosticsDialog = true },
-                        onExportPng = { exportAndSharePng() }
+                        onExportPng = { exportAndSharePng() },
+                        canClear = canUndo,
+                        onClear = { confirmClear = true }
                     )
 
                     Box(
@@ -279,7 +283,6 @@ class MainActivity : ComponentActivity() {
                             activeTool = activeTool,
                             activeColor = currentIndicatorColor(),
                             autoShapeEnabled = autoShapeEnabled,
-                            hasContent = canUndo,
                             strokePanelOpen = showStrokePanel,
                             onSelectTool = { tool ->
                                 activeTool = tool
@@ -290,8 +293,7 @@ class MainActivity : ComponentActivity() {
                             onToggleAutoShape = {
                                 autoShapeEnabled = !autoShapeEnabled
                                 sheet?.autoShapeEnabled = autoShapeEnabled
-                            },
-                            onRequestClear = { confirmClear = true }
+                            }
                         )
                     }
                 }
@@ -462,189 +464,6 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun TopEditorBar(
-    title: String,
-    zoomPercent: Int,
-    focusMode: Boolean,
-    onToggleFocus: () -> Unit,
-    canUndo: Boolean,
-    canRedo: Boolean,
-    onFitContent: () -> Unit,
-    onUndo: () -> Unit,
-    onRedo: () -> Unit,
-    onOpenPaper: () -> Unit,
-    onOpenDiagnostics: () -> Unit,
-    onExportPng: () -> Unit
-) {
-    Surface(
-        color = GraphiteSurface,
-        border = BorderStroke(0.5.dp, GraphiteBorder)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-                color = InkTextPrimary
-            )
-            Spacer(Modifier.width(8.dp))
-            Surface(
-                color = PetroleumDeep,
-                shape = RoundedCornerShape(8.dp),
-                modifier = Modifier.clickable(onClick = onFitContent)
-            ) {
-                Text(
-                    text = "$zoomPercent% · Encajar",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = InkTextPrimary,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                )
-            }
-            Spacer(Modifier.weight(1f))
-            TextButton(onClick = onUndo, enabled = canUndo) {
-                Text("↶", style = MaterialTheme.typography.titleMedium)
-            }
-            TextButton(onClick = onRedo, enabled = canRedo) {
-                Text("↷", style = MaterialTheme.typography.titleMedium)
-            }
-            EditorMenu(
-                focusMode, onToggleFocus, onOpenPaper, onOpenDiagnostics, onExportPng
-            )
-        }
-    }
-}
-
-@Composable
-private fun EditorMenu(
-    focusMode: Boolean,
-    onToggleFocus: () -> Unit,
-    onOpenPaper: () -> Unit,
-    onOpenDiagnostics: () -> Unit,
-    onExportPng: () -> Unit
-) {
-    var expanded by androidx.compose.runtime.remember { mutableStateOf(false) }
-    Box {
-        TextButton(onClick = { expanded = true }) { Text("Menú") }
-        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            val actions = listOf(
-                (if (focusMode) "Mostrar herramientas" else "Modo enfoque") to onToggleFocus,
-                "Papel y plantilla" to onOpenPaper,
-                "Diagnóstico" to onOpenDiagnostics,
-                "Exportar PNG" to onExportPng
-            )
-            for ((label, action) in actions) {
-                DropdownMenuItem(
-                    text = { Text(label) },
-                    onClick = {
-                        expanded = false
-                        action()
-                    }
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun BottomToolBar(
-    activeTool: ToolMode,
-    activeColor: Color,
-    autoShapeEnabled: Boolean,
-    hasContent: Boolean,
-    strokePanelOpen: Boolean,
-    onSelectTool: (ToolMode) -> Unit,
-    onToggleStrokePanel: () -> Unit,
-    onToggleAutoShape: () -> Unit,
-    onRequestClear: () -> Unit
-) {
-    Surface(
-        color = GraphiteSurface,
-        border = BorderStroke(0.5.dp, GraphiteBorder)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            ToolMode.entries.forEach { tool ->
-                val selected = activeTool == tool
-                FilterChip(
-                    selected = selected,
-                    onClick = { onSelectTool(tool) },
-                    label = { Text(tool.label) },
-                    colors = FilterChipDefaults.filterChipColors(
-                        selectedContainerColor = PetroleumDeep,
-                        selectedLabelColor = InkTextPrimary,
-                        containerColor = GraphiteBg,
-                        labelColor = InkTextSecondary
-                    ),
-                    border = FilterChipDefaults.filterChipBorder(
-                        enabled = true,
-                        selected = selected,
-                        borderColor = GraphiteBorder,
-                        selectedBorderColor = Petroleum
-                    )
-                )
-            }
-
-            // Color & Width trigger
-            Surface(
-                color = if (strokePanelOpen) PetroleumDeep else GraphiteBg,
-                shape = RoundedCornerShape(10.dp),
-                border = BorderStroke(1.dp, if (strokePanelOpen) Petroleum else GraphiteBorder),
-                modifier = Modifier.clickable(onClick = onToggleStrokePanel)
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Box(
-                        Modifier
-                            .size(16.dp)
-                            .clip(CircleShape)
-                            .background(activeColor)
-                            .border(1.dp, InkTextPrimary.copy(alpha = 0.5f), CircleShape)
-                    )
-                    Text("Trazo", style = MaterialTheme.typography.labelLarge, color = InkTextPrimary)
-                }
-            }
-
-            // Auto-Shape toggle
-            FilterChip(
-                selected = autoShapeEnabled,
-                onClick = onToggleAutoShape,
-                label = { Text("Formas") },
-                colors = FilterChipDefaults.filterChipColors(
-                    selectedContainerColor = PetroleumDeep,
-                    selectedLabelColor = InkTextPrimary,
-                    containerColor = GraphiteBg,
-                    labelColor = InkTextSecondary
-                ),
-                border = FilterChipDefaults.filterChipBorder(
-                    enabled = true,
-                    selected = autoShapeEnabled,
-                    borderColor = GraphiteBorder,
-                    selectedBorderColor = Petroleum
-                )
-            )
-
-            TextButton(onClick = onRequestClear, enabled = hasContent) {
-                Text("Limpiar", color = if (hasContent) Color(0xFFE06C75) else InkTextSecondary)
-            }
-        }
-    }
-}
-
-@Composable
 private fun StrokeConfigPanel(
     tool: ToolMode,
     selectedPenIdx: Int,
@@ -697,18 +516,24 @@ private fun StrokeConfigPanel(
                         val isSelected = idx == selectedIdx
                         Box(
                             modifier = Modifier
-                                .size(32.dp)
+                                .size(44.dp)
                                 .clip(CircleShape)
-                                .background(Color(swatch.argb))
+                                .semantics { contentDescription = swatch.name }
+                                .selectable(
+                                    selected = isSelected,
+                                    role = Role.RadioButton,
+                                    onClick = {
+                                        if (tool == ToolMode.HIGHLIGHTER) onSelectHighlighterColor(idx)
+                                        else onSelectPenColor(idx)
+                                    }
+                                )
                                 .border(
-                                    width = if (isSelected) 2.5.dp else 1.dp,
+                                    width = if (isSelected) 2.dp else 1.dp,
                                     color = if (isSelected) Petroleum else GraphiteBorder,
                                     shape = CircleShape
                                 )
-                                .clickable {
-                                    if (tool == ToolMode.HIGHLIGHTER) onSelectHighlighterColor(idx)
-                                    else onSelectPenColor(idx)
-                                }
+                                .padding(5.dp)
+                                .background(Color(swatch.argb), CircleShape)
                         )
                     }
                 }
