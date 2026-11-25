@@ -237,7 +237,7 @@ class MainActivity : ComponentActivity() {
                         }
 
                         // Floating lasso action bar (with 1-tap recolor swatches)
-                        AnimatedVisibility(
+                        androidx.compose.animation.AnimatedVisibility(
                             visible = hasSelection,
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
@@ -293,7 +293,7 @@ class MainActivity : ComponentActivity() {
                         }
 
                         // Floating color & width tuning popover
-                        AnimatedVisibility(
+                        androidx.compose.animation.AnimatedVisibility(
                             visible = showStrokePanel,
                             modifier = Modifier
                                 .align(Alignment.TopCenter)

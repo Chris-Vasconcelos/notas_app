@@ -291,7 +291,7 @@ internal fun MovablePenBox(
         }
     }
 
-    val dragModifier = Modifier.pointerInput(containerSize, isVertical, isCollapsed) {
+    val dragModifier = Modifier.pointerInput(containerSize) {
         detectDragGestures(
             onDragEnd = { clampAndSnap(snapEdges = true) },
             onDragCancel = { clampAndSnap(snapEdges = true) }
