@@ -57,6 +57,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import java.util.Locale
 import kotlin.math.roundToInt
 
 private val ActiveTile = Color(0xff23393c)
