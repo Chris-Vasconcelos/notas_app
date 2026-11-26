@@ -81,6 +81,10 @@ internal fun TopEditorBar(
     totalPages: Int,
     layoutMode: CanvasLayoutMode,
     activeLayerName: String,
+    leftDrawerOpen: Boolean,
+    onToggleLeftDrawer: () -> Unit,
+    onOpenLibrary: () -> Unit,
+    onInsertImage: () -> Unit,
     rulerEnabled: Boolean,
     onToggleRuler: () -> Unit,
     minimapOpen: Boolean,
@@ -113,14 +117,16 @@ internal fun TopEditorBar(
     Row(
         Modifier
             .fillMaxWidth()
-            .padding(start = 12.dp, end = 4.dp),
+            .padding(start = 6.dp, end = 4.dp),
         horizontalArrangement = Arrangement.spacedBy(1.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        HeaderButton("Biblioteca y carpetas", EditorGlyph.Back, action = onOpenLibrary)
+        HeaderButton("Cajón de documentos y pantalla dividida", EditorGlyph.LeftDrawer, active = leftDrawerOpen, action = onToggleLeftDrawer)
         Column(
             Modifier
                 .weight(1f)
-                .padding(end = 4.dp)
+                .padding(horizontal = 4.dp)
                 .clickable(onClick = onFitContent)
         ) {
             Text(
@@ -143,6 +149,7 @@ internal fun TopEditorBar(
         HeaderButton("Cuadrícula de páginas", EditorGlyph.Grid, active = gridViewOpen, action = onToggleGridView)
         HeaderButton("Deshacer", EditorGlyph.Undo, enabled = canUndo, action = onUndo)
         HeaderButton("Rehacer", EditorGlyph.Redo, enabled = canRedo, action = onRedo)
+        HeaderButton("Insertar imagen", EditorGlyph.Image, action = onInsertImage)
         HeaderButton("Regla virtual", EditorGlyph.Ruler, active = rulerEnabled, action = onToggleRuler)
         HeaderButton("Capas", EditorGlyph.Layers, action = onOpenLayers)
         HeaderButton("Minimapa de lienzo infinito", EditorGlyph.Minimap, active = minimapOpen, action = onToggleMinimap)
@@ -163,6 +170,20 @@ internal fun TopEditorBar(
             var expanded by remember { mutableStateOf(false) }
             HeaderButton("Más opciones", EditorGlyph.Menu) { expanded = true }
             DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                DropdownMenuItem(
+                    text = { Text("Biblioteca de cuadernos y carpetas") },
+                    onClick = {
+                        expanded = false
+                        onOpenLibrary()
+                    }
+                )
+                DropdownMenuItem(
+                    text = { Text("Insertar imagen en la hoja") },
+                    onClick = {
+                        expanded = false
+                        onInsertImage()
+                    }
+                )
                 DropdownMenuItem(
                     text = { Text("Ajustar hoja a pantalla (Doble toque)") },
                     onClick = {
@@ -843,7 +864,9 @@ private fun QuickWidthDots(
     currentWidthDp: Float,
     onSelectWidth: (Float) -> Unit
 ) {
-    if (activeTool == ToolMode.LASSO || activeTool == ToolMode.LASER || activeTool == ToolMode.TEXT) return
+    if (activeTool == ToolMode.LASSO || activeTool == ToolMode.LASER ||
+        activeTool == ToolMode.TEXT || activeTool == ToolMode.LINK
+    ) return
     val presets = when (activeTool) {
         ToolMode.HIGHLIGHTER -> listOf(12f, 18f, 26f)
         ToolMode.TAPE -> listOf(16f, 22f, 30f)
@@ -962,14 +985,15 @@ private fun glyphForTool(tool: ToolMode): EditorGlyph = when (tool) {
     ToolMode.TAPE -> EditorGlyph.Tape
     ToolMode.SHAPES -> EditorGlyph.Shapes
     ToolMode.TEXT -> EditorGlyph.Text
+    ToolMode.LINK -> EditorGlyph.Link
     ToolMode.LASER -> EditorGlyph.Laser
     ToolMode.ERASER -> EditorGlyph.Eraser
     ToolMode.LASSO -> EditorGlyph.Lasso
 }
 
 private enum class EditorGlyph {
-    Pen, Ballpoint, Dashed, Marker, Tape, Shapes, Text, Laser, Eraser, Lasso,
-    Ruler, Layers, Minimap, Grid, Sidebar, Swatch, Undo, Redo, Reading, Focus, Menu
+    Pen, Ballpoint, Dashed, Marker, Tape, Shapes, Text, Link, Laser, Eraser, Lasso,
+    Back, LeftDrawer, Image, Ruler, Layers, Minimap, Grid, Sidebar, Swatch, Undo, Redo, Reading, Focus, Menu
 }
 
 @Composable
@@ -1017,6 +1041,23 @@ private fun DrawGlyph(glyph: EditorGlyph, tint: Color, swatch: Color = Color.Tra
                     drawRoundRect(tint, Offset(3f, 4f), Size(18f, 16f), CornerRadius(3f), style = outline)
                     lines(listOf(Offset(8f, 8f), Offset(16f, 8f)))
                     lines(listOf(Offset(12f, 8f), Offset(12f, 16f)))
+                }
+                EditorGlyph.Link -> {
+                    drawRoundRect(tint, Offset(3f, 8f), Size(8f, 8f), CornerRadius(4f), style = outline)
+                    drawRoundRect(tint, Offset(13f, 8f), Size(8f, 8f), CornerRadius(4f), style = outline)
+                    lines(listOf(Offset(8.5f, 12f), Offset(15.5f, 12f)))
+                }
+                EditorGlyph.Back -> {
+                    lines(listOf(Offset(15f, 5f), Offset(8f, 12f), Offset(15f, 19f)))
+                }
+                EditorGlyph.LeftDrawer -> {
+                    drawRoundRect(tint, Offset(3f, 4f), Size(18f, 16f), CornerRadius(2f), style = outline)
+                    lines(listOf(Offset(9f, 4f), Offset(9f, 20f)))
+                }
+                EditorGlyph.Image -> {
+                    drawRoundRect(tint, Offset(3f, 4f), Size(18f, 16f), CornerRadius(2.5f), style = outline)
+                    drawCircle(tint, radius = 1.8f, center = Offset(8.5f, 9f))
+                    lines(listOf(Offset(4f, 18f), Offset(10f, 13f), Offset(14f, 16f), Offset(17.5f, 12f), Offset(20.5f, 16.5f)))
                 }
                 EditorGlyph.Laser -> {
                     drawCircle(tint, radius = 3.2f, center = Offset(12f, 12f))
@@ -1509,6 +1550,467 @@ internal fun PageGridModal(
                             }
                         }
                         repeat(3 - rowPages.size) {
+                            Box(Modifier.weight(1f))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Left Document Drawer + In-App Split Screen Launcher (Section 16 · 左侧边栏的作用 & 应用内分屏).
+ */
+@Composable
+internal fun LeftDocumentDrawer(
+    notebooks: List<NoteMetadata>,
+    activeUuid: String,
+    splitUuid: String?,
+    onSelectNotebook: (NoteMetadata) -> Unit,
+    onOpenInSplitScreen: (NoteMetadata) -> Unit,
+    onCloseSplitScreen: () -> Unit,
+    onCreateQuickNote: () -> Unit,
+    onOpenFullLibrary: () -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        color = GraphiteSurface.copy(alpha = 0.98f),
+        shape = RoundedCornerShape(topEnd = 18.dp, bottomEnd = 18.dp),
+        border = BorderStroke(1.dp, GraphiteBorder),
+        shadowElevation = 16.dp,
+        modifier = modifier.width(268.dp)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Documentos recientes",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = InkTextPrimary,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = onClose) {
+                    Text("×", style = MaterialTheme.typography.titleMedium, color = InkTextSecondary)
+                }
+            }
+            Text(
+                "Toca para abrir o usa «◫ Dividir» para pantalla dividida in-app",
+                style = MaterialTheme.typography.labelSmall,
+                color = InkTextSecondary,
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
+            if (splitUuid != null) {
+                Surface(
+                    color = ActiveTile,
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, Mint),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp)
+                        .clickable { onCloseSplitScreen() }
+                ) {
+                    Text(
+                        "Cerrar pantalla dividida activa (×)",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Mint,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                    )
+                }
+            }
+            Column(
+                modifier = Modifier
+                    .weight(1f, fill = false)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                notebooks.forEach { nb ->
+                    val isCurrent = nb.uuid == activeUuid
+                    val isSplit = nb.uuid == splitUuid
+                    Surface(
+                        color = if (isCurrent) ActiveTile else GraphiteBg,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(
+                            width = if (isCurrent || isSplit) 1.5.dp else 1.dp,
+                            color = when {
+                                isCurrent -> Mint
+                                isSplit -> Color(0xFF00B4D8)
+                                else -> GraphiteBorder
+                            }
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                onSelectNotebook(nb)
+                                onClose()
+                            }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                Modifier
+                                    .size(width = 10.dp, height = 36.dp)
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(Color(nb.coverColorArgb))
+                            )
+                            Column(
+                                Modifier
+                                    .weight(1f)
+                                    .padding(horizontal = 8.dp)
+                            ) {
+                                Text(
+                                    nb.title,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Normal,
+                                    color = InkTextPrimary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    if (nb.layoutMode == CanvasLayoutMode.PAGED) "${nb.pageCount} págs · ${nb.paperTemplate.label}"
+                                    else "Lienzo infinito · ${nb.paperTemplate.label}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = InkTextSecondary
+                                )
+                            }
+                            if (!isCurrent) {
+                                TextButton(
+                                    onClick = {
+                                        onOpenInSplitScreen(nb)
+                                        onClose()
+                                    }
+                                ) {
+                                    Text("◫ Dividir", style = MaterialTheme.typography.labelSmall, color = Mint)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            HorizontalDivider(color = GraphiteBorder, modifier = Modifier.padding(vertical = 6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TextButton(onClick = {
+                    onCreateQuickNote()
+                    onClose()
+                }) {
+                    Text("+ Nota rápida", style = MaterialTheme.typography.labelMedium, color = Mint)
+                }
+                TextButton(onClick = {
+                    onOpenFullLibrary()
+                    onClose()
+                }) {
+                    Text("Carpetas →", style = MaterialTheme.typography.labelMedium, color = InkTextPrimary)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Full-screen Notebook & Color-Coded Folder Library Modal (Sections 01 & 04 · 无限层级文件夹).
+ */
+@Composable
+internal fun NotebookLibraryModal(
+    folders: List<NotebookFolder>,
+    notebooks: List<NoteMetadata>,
+    activeUuid: String,
+    selectedFolderId: String?,
+    onSelectFolder: (String?) -> Unit,
+    onCreateFolder: (name: String, colorArgb: Int) -> Unit,
+    onCreateNotebook: (title: String, layoutMode: CanvasLayoutMode, folderId: String?, coverColorArgb: Int) -> Unit,
+    onOpenNotebook: (NoteMetadata) -> Unit,
+    onOpenInSplitScreen: (NoteMetadata) -> Unit,
+    onDeleteNotebook: (NoteMetadata) -> Unit,
+    onClose: () -> Unit
+) {
+    var showNewFolderRow by remember { mutableStateOf(false) }
+    var newFolderName by remember { mutableStateOf("") }
+    var newFolderColor by remember { mutableStateOf(0xFF2AA1B7.toInt()) }
+
+    var showNewNoteRow by remember { mutableStateOf(false) }
+    var newNoteTitle by remember { mutableStateOf("") }
+    var newNoteMode by remember { mutableStateOf(CanvasLayoutMode.PAGED) }
+    var newNoteColor by remember { mutableStateOf(0xFF2AA1B7.toInt()) }
+
+    val folderSwatches = listOf(
+        0xFF2AA1B7.toInt(),
+        0xFF1E58CC.toInt(),
+        0xFF1E7A56.toInt(),
+        0xFF6C4AB6.toInt(),
+        0xFFC77818.toInt(),
+        0xFFB9324B.toInt()
+    )
+
+    Surface(
+        color = GraphiteBg.copy(alpha = 0.99f),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Biblioteca · Cuadernos y Carpetas",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = InkTextPrimary,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = { showNewFolderRow = !showNewFolderRow }) {
+                    Text("+ Carpeta", color = InkTextSecondary)
+                }
+                TextButton(onClick = { showNewNoteRow = !showNewNoteRow }) {
+                    Text("+ Cuaderno", color = Mint)
+                }
+                TextButton(onClick = onClose) {
+                    Text("Volver al editor")
+                }
+            }
+
+            // Folder filter chips (All + color-coded folders)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                val allSel = selectedFolderId == null
+                Surface(
+                    color = if (allSel) ActiveTile else GraphiteSurface,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, if (allSel) Mint else GraphiteBorder),
+                    modifier = Modifier.clickable { onSelectFolder(null) }
+                ) {
+                    Text(
+                        "Todos (${notebooks.size})",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (allSel) Mint else InkTextPrimary,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                    )
+                }
+                folders.forEach { folder ->
+                    val sel = selectedFolderId == folder.id
+                    Surface(
+                        color = if (sel) ActiveTile else GraphiteSurface,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.5.dp, if (sel) Mint else Color(folder.colorArgb)),
+                        modifier = Modifier.clickable { onSelectFolder(folder.id) }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Box(
+                                Modifier
+                                    .size(10.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(folder.colorArgb))
+                            )
+                            Text(
+                                folder.name,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (sel) Mint else InkTextPrimary
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (showNewFolderRow) {
+                Surface(
+                    color = GraphiteSurface,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, GraphiteBorder),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("Color:", style = MaterialTheme.typography.labelSmall, color = InkTextSecondary)
+                        folderSwatches.forEach { col ->
+                            Box(
+                                Modifier
+                                    .size(22.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(col))
+                                    .border(if (col == newFolderColor) 2.dp else 1.dp, InkTextPrimary, CircleShape)
+                                    .clickable { newFolderColor = col }
+                            )
+                        }
+                        TextButton(
+                            onClick = {
+                                val name = if (newFolderName.isBlank()) "Carpeta ${folders.size + 1}" else newFolderName.trim()
+                                onCreateFolder(name, newFolderColor)
+                                newFolderName = ""
+                                showNewFolderRow = false
+                            }
+                        ) {
+                            Text("Crear carpeta", color = Mint)
+                        }
+                    }
+                }
+            }
+
+            if (showNewNoteRow) {
+                Surface(
+                    color = GraphiteSurface,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, Mint),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                ) {
+                    Column(modifier = Modifier.padding(10.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            CanvasLayoutMode.entries.forEach { mode ->
+                                val sel = mode == newNoteMode
+                                Surface(
+                                    color = if (sel) ActiveTile else GraphiteBg,
+                                    shape = RoundedCornerShape(8.dp),
+                                    border = BorderStroke(1.dp, if (sel) Mint else GraphiteBorder),
+                                    modifier = Modifier.clickable { newNoteMode = mode }
+                                ) {
+                                    Text(
+                                        mode.label,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = if (sel) Mint else InkTextSecondary,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                    )
+                                }
+                            }
+                            folderSwatches.forEach { col ->
+                                Box(
+                                    Modifier
+                                        .size(22.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(col))
+                                        .border(if (col == newNoteColor) 2.dp else 1.dp, InkTextPrimary, CircleShape)
+                                        .clickable { newNoteColor = col }
+                                )
+                            }
+                            TextButton(
+                                onClick = {
+                                    val t = if (newNoteTitle.isBlank()) "Apunte ${notebooks.size + 1}" else newNoteTitle.trim()
+                                    onCreateNotebook(t, newNoteMode, selectedFolderId, newNoteColor)
+                                    newNoteTitle = ""
+                                    showNewNoteRow = false
+                                }
+                            ) {
+                                Text("Crear y abrir", color = Mint)
+                            }
+                        }
+                    }
+                }
+            }
+
+            val visibleNotes = if (selectedFolderId == null) {
+                notebooks
+            } else {
+                notebooks.filter { it.folderId == selectedFolderId }
+            }
+
+            Column(
+                modifier = Modifier
+                    .padding(top = 8.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                visibleNotes.chunked(2).forEach { rowNotes ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        rowNotes.forEach { nb ->
+                            val isCurrent = nb.uuid == activeUuid
+                            Surface(
+                                color = if (isCurrent) ActiveTile else GraphiteSurface,
+                                shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(
+                                    width = if (isCurrent) 2.dp else 1.dp,
+                                    color = if (isCurrent) Mint else GraphiteBorder
+                                ),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable {
+                                        onOpenNotebook(nb)
+                                        onClose()
+                                    }
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Box(
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .height(10.dp)
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .background(Color(nb.coverColorArgb))
+                                    )
+                                    Text(
+                                        nb.title,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = InkTextPrimary,
+                                        fontWeight = FontWeight.SemiBold,
+                                        modifier = Modifier.padding(top = 8.dp)
+                                    )
+                                    Text(
+                                        if (nb.layoutMode == CanvasLayoutMode.PAGED) "${nb.pageCount} páginas · ${nb.paperTemplate.label}"
+                                        else "Lienzo infinito · ${nb.paperTemplate.label}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = InkTextSecondary
+                                    )
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(top = 6.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        if (!isCurrent) {
+                                            Text(
+                                                "◫ Dividir pantalla",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = Mint,
+                                                modifier = Modifier
+                                                    .clickable {
+                                                        onOpenInSplitScreen(nb)
+                                                        onClose()
+                                                    }
+                                                    .padding(vertical = 2.dp)
+                                            )
+                                            if (notebooks.size > 1) {
+                                                Text(
+                                                    "Eliminar",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = Color(0xFFE06C75),
+                                                    modifier = Modifier
+                                                        .clickable { onDeleteNotebook(nb) }
+                                                        .padding(vertical = 2.dp)
+                                                )
+                                            }
+                                        } else {
+                                            Text(
+                                                "Abierto actualmente",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = Mint
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (rowNotes.size == 1) {
                             Box(Modifier.weight(1f))
                         }
                     }

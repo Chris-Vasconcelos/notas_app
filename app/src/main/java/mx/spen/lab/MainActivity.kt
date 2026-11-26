@@ -3,7 +3,9 @@ package mx.spen.lab
 import android.content.ContentValues
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.RectF
+import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
@@ -14,6 +16,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -24,6 +27,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -89,8 +93,34 @@ private data class PendingTextBoxEdit(
     val worldY: Float
 )
 
+private data class PendingLinkEdit(
+    val existing: PenSheet.LinkItem?,
+    val worldX: Float,
+    val worldY: Float
+)
+
 class MainActivity : ComponentActivity() {
     private var sheet: PenSheet? = null
+    private var splitSheet: PenSheet? = null
+
+    private val pickImageLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        if (uri != null) {
+            importPickedImage(uri)
+        }
+    }
+
+    // Notebook & Folder Library state (Sections 01, 04, 16)
+    private var activeNotebookUuid by mutableStateOf("default-notebook")
+    private var activeNotebookTitle by mutableStateOf("Cuaderno Principal")
+    private var activeNotebookFolderId by mutableStateOf<String?>(null)
+    private var activeNotebookCoverColor by mutableIntStateOf(0xFF2AA1B7.toInt())
+    private var splitNotebookUuid by mutableStateOf<String?>(null)
+    private var splitNotebookTitle by mutableStateOf("")
+    private val allNotebooks = mutableStateListOf<NoteMetadata>()
+    private val allFolders = mutableStateListOf<NotebookFolder>()
+    private var selectedLibraryFolderId by mutableStateOf<String?>(null)
+    private var leftDrawerOpen by mutableStateOf(false)
+    private var libraryModalOpen by mutableStateOf(false)
 
     // Editor state
     private var activeTool by mutableStateOf(ToolMode.PEN)
@@ -178,6 +208,7 @@ class MainActivity : ComponentActivity() {
     private var showHelpDialog by mutableStateOf(false)
     private var confirmClear by mutableStateOf(false)
     private var pendingTextBoxEdit by mutableStateOf<PendingTextBoxEdit?>(null)
+    private var pendingLinkEdit by mutableStateOf<PendingLinkEdit?>(null)
 
     // Diagnostics & Air Actions
     private var showHudOverlay by mutableStateOf(false)
@@ -193,7 +224,7 @@ class MainActivity : ComponentActivity() {
         val darkBars = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
         enableEdgeToEdge(statusBarStyle = darkBars, navigationBarStyle = darkBars)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        val appTitle = getString(applicationInfo.labelRes)
+        refreshLibraryLists()
 
         setContent {
             MaterialTheme(
@@ -213,12 +244,31 @@ class MainActivity : ComponentActivity() {
                         .safeDrawingPadding()
                 ) {
                     TopEditorBar(
-                        title = appTitle,
+                        title = if (splitNotebookUuid != null) "$activeNotebookTitle ◫ $splitNotebookTitle" else activeNotebookTitle,
                         zoomPercent = telemetry.zoomPercent,
                         currentPage = telemetry.currentPage,
                         totalPages = telemetry.totalPages,
                         layoutMode = layoutMode,
                         activeLayerName = activeLayerName,
+                        leftDrawerOpen = leftDrawerOpen,
+                        onToggleLeftDrawer = {
+                            leftDrawerOpen = !leftDrawerOpen
+                            if (leftDrawerOpen) {
+                                rightSidebarOpen = false
+                                gridViewOpen = false
+                                refreshLibraryLists()
+                            }
+                        },
+                        onOpenLibrary = {
+                            refreshLibraryLists()
+                            libraryModalOpen = true
+                            leftDrawerOpen = false
+                            rightSidebarOpen = false
+                            gridViewOpen = false
+                        },
+                        onInsertImage = {
+                            pickImageLauncher.launch("image/*")
+                        },
                         rulerEnabled = rulerEnabled,
                         onToggleRuler = {
                             rulerEnabled = !rulerEnabled
@@ -309,35 +359,123 @@ class MainActivity : ComponentActivity() {
                             .fillMaxWidth()
                             .onSizeChanged { canvasSize = it }
                     ) {
-                        AndroidView(
-                            factory = { context ->
-                                PenSheet(
-                                    context = context,
-                                    onStateChanged = { undo, redo, sel ->
-                                        canUndo = undo
-                                        canRedo = redo
-                                        hasSelection = sel
-                                        minimapTrigger++
+                        Row(Modifier.fillMaxSize()) {
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight()
+                            ) {
+                                AndroidView(
+                                    factory = { context ->
+                                        PenSheet(
+                                            context = context,
+                                            onStateChanged = { undo, redo, sel ->
+                                                canUndo = undo
+                                                canRedo = redo
+                                                hasSelection = sel
+                                                minimapTrigger++
+                                            },
+                                            onTelemetryChanged = { t ->
+                                                telemetry = t
+                                                minimapTrigger++
+                                            },
+                                            onRequestTextBoxEditor = { existing, wx, wy ->
+                                                pendingTextBoxEdit = PendingTextBoxEdit(existing, wx, wy)
+                                            },
+                                            onRequestLinkEditor = { existing, wx, wy ->
+                                                pendingLinkEdit = PendingLinkEdit(existing, wx, wy)
+                                            },
+                                            onActivateLink = { link ->
+                                                handleActivateLink(link)
+                                            },
+                                            onContentMutated = {
+                                                scheduleAutoSave()
+                                            }
+                                        ).also { view ->
+                                            sheet = view
+                                            syncSheetConfig(view)
+                                            loadPersistedNotebook(view, activeNotebookUuid)
+                                            refreshActiveLayerName()
+                                        }
                                     },
-                                    onTelemetryChanged = { t ->
-                                        telemetry = t
-                                        minimapTrigger++
-                                    },
-                                    onRequestTextBoxEditor = { existing, wx, wy ->
-                                        pendingTextBoxEdit = PendingTextBoxEdit(existing, wx, wy)
-                                    },
-                                    onContentMutated = {
-                                        scheduleAutoSave()
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
+
+                            // In-App Split Screen Secondary Notebook (Section 16 · 应用内分屏)
+                            val activeSplitUuid = splitNotebookUuid
+                            if (activeSplitUuid != null) {
+                                Box(
+                                    Modifier
+                                        .width(2.dp)
+                                        .fillMaxHeight()
+                                        .background(Petroleum)
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .fillMaxHeight()
+                                ) {
+                                    androidx.compose.runtime.key(activeSplitUuid) {
+                                        AndroidView(
+                                            factory = { context ->
+                                                PenSheet(
+                                                    context = context,
+                                                    onStateChanged = { _, _, _ -> },
+                                                    onContentMutated = {
+                                                        scheduleAutoSave()
+                                                    }
+                                                ).also { sView ->
+                                                    splitSheet = sView
+                                                    syncSheetConfig(sView)
+                                                    val loaded = NoteRepository.load(filesDir, activeSplitUuid)
+                                                    if (loaded != null) {
+                                                        sView.importPersistedSession(
+                                                            loaded.first,
+                                                            loaded.second,
+                                                            imageLoader = { fileName -> loadNotebookImage(activeSplitUuid, fileName) }
+                                                        )
+                                                    }
+                                                }
+                                            },
+                                            modifier = Modifier.fillMaxSize()
+                                        )
                                     }
-                                ).also { view ->
-                                    sheet = view
-                                    syncSheetConfig(view)
-                                    loadPersistedNotebook(view)
-                                    refreshActiveLayerName()
+                                    Surface(
+                                        color = GraphiteSurface.copy(alpha = 0.92f),
+                                        shape = RoundedCornerShape(12.dp),
+                                        border = BorderStroke(1.dp, Petroleum),
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .padding(8.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            Text(
+                                                splitNotebookTitle,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = InkTextPrimary
+                                            )
+                                            Text(
+                                                "×",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                color = Color(0xFFE06C75),
+                                                modifier = Modifier
+                                                    .clickable {
+                                                        persistSplitNotebook()
+                                                        splitNotebookUuid = null
+                                                        splitSheet = null
+                                                    }
+                                                    .padding(horizontal = 4.dp)
+                                            )
+                                        }
+                                    }
                                 }
-                            },
-                            modifier = Modifier.fillMaxSize()
-                        )
+                            }
+                        }
 
                         // Floating feedback pill for detected shapes
                         telemetry.lastShapeDetected?.let { shapeName ->
@@ -700,7 +838,101 @@ class MainActivity : ComponentActivity() {
                                 onClose = { gridViewOpen = false }
                             )
                         }
+
+                        // Left Document Drawer + Split Screen Launcher (Section 16 · 左侧边栏的作用)
+                        if (leftDrawerOpen) {
+                            LeftDocumentDrawer(
+                                notebooks = allNotebooks,
+                                activeUuid = activeNotebookUuid,
+                                splitUuid = splitNotebookUuid,
+                                onSelectNotebook = { nb -> switchActiveNotebook(nb.uuid) },
+                                onOpenInSplitScreen = { nb -> openInSplitScreen(nb) },
+                                onCloseSplitScreen = {
+                                    persistSplitNotebook()
+                                    splitNotebookUuid = null
+                                    splitSheet = null
+                                },
+                                onCreateQuickNote = { createNewNotebook("Nota rápida ${allNotebooks.size + 1}", CanvasLayoutMode.PAGED, null, 0xFF2AA1B7.toInt()) },
+                                onOpenFullLibrary = { libraryModalOpen = true },
+                                onClose = { leftDrawerOpen = false },
+                                modifier = Modifier.align(Alignment.TopStart)
+                            )
+                        }
+
+                        // Full-screen Notebook & Color-Coded Folder Library Modal (Sections 01 & 04)
+                        if (libraryModalOpen) {
+                            NotebookLibraryModal(
+                                folders = allFolders,
+                                notebooks = allNotebooks,
+                                activeUuid = activeNotebookUuid,
+                                selectedFolderId = selectedLibraryFolderId,
+                                onSelectFolder = { fid -> selectedLibraryFolderId = fid },
+                                onCreateFolder = { name, col ->
+                                    val folder = NotebookFolder(
+                                        id = "f-${System.currentTimeMillis()}",
+                                        name = name,
+                                        colorArgb = col
+                                    )
+                                    allFolders.add(folder)
+                                    NoteRepository.saveFolders(filesDir, allFolders)
+                                },
+                                onCreateNotebook = { title, mode, fid, col ->
+                                    createNewNotebook(title, mode, fid, col)
+                                    libraryModalOpen = false
+                                },
+                                onOpenNotebook = { nb -> switchActiveNotebook(nb.uuid) },
+                                onOpenInSplitScreen = { nb -> openInSplitScreen(nb) },
+                                onDeleteNotebook = { nb ->
+                                    if (nb.uuid != activeNotebookUuid && allNotebooks.size > 1) {
+                                        if (splitNotebookUuid == nb.uuid) {
+                                            splitNotebookUuid = null
+                                            splitSheet = null
+                                        }
+                                        NoteRepository.deleteNotebook(filesDir, nb.uuid)
+                                        refreshLibraryLists()
+                                    }
+                                },
+                                onClose = { libraryModalOpen = false }
+                            )
+                        }
                     }
+                }
+
+                // Bidirectional & Page Hyperlink Editor Dialog (Sections 20 & 21 · 双向链接 & 超链接)
+                pendingLinkEdit?.let { linkReq ->
+                    LinkEditorDialog(
+                        existing = linkReq.existing,
+                        notebooks = allNotebooks,
+                        totalPages = telemetry.totalPages.coerceAtLeast(1),
+                        defaultColorArgb = currentPenPalette()[selectedPenColorIdx].argb,
+                        onConfirm = { label, kind, targetVal, col ->
+                            sheet?.addOrUpdateLinkItem(
+                                existingId = linkReq.existing?.id,
+                                worldX = linkReq.worldX,
+                                worldY = linkReq.worldY,
+                                label = label,
+                                targetKind = kind,
+                                targetValue = targetVal,
+                                color = col
+                            )
+                            pendingLinkEdit = null
+                        },
+                        onDelete = {
+                            linkReq.existing?.let { existing ->
+                                sheet?.addOrUpdateLinkItem(
+                                    existingId = existing.id,
+                                    worldX = linkReq.worldX,
+                                    worldY = linkReq.worldY,
+                                    label = "",
+                                    targetKind = existing.targetKind,
+                                    targetValue = existing.targetValue,
+                                    color = existing.color
+                                )
+                            }
+                            pendingLinkEdit = null
+                        },
+                        onDismiss = { pendingLinkEdit = null }
+                    )
                 }
 
                 // Add Outline Bookmark Dialog (Section 17 · 大纲)
@@ -1051,11 +1283,19 @@ class MainActivity : ComponentActivity() {
     private fun selectTool(tool: ToolMode) {
         activeTool = tool
         sheet?.toolMode = tool
+        splitSheet?.toolMode = tool
         if (tool == ToolMode.TEXT) {
             showStrokePanel = false
             Toast.makeText(
                 this,
                 "Toca cualquier parte de la hoja para insertar o editar una caja de texto",
+                Toast.LENGTH_SHORT
+            ).show()
+        } else if (tool == ToolMode.LINK) {
+            showStrokePanel = false
+            Toast.makeText(
+                this,
+                "Toca cualquier parte de la hoja para insertar o editar un hipervínculo (🔗)",
                 Toast.LENGTH_SHORT
             ).show()
         }
@@ -1176,6 +1416,7 @@ class MainActivity : ComponentActivity() {
         super.onPause()
         saveHandler.removeCallbacks(debouncedSaveRunnable)
         performPersistToDisk()
+        persistSplitNotebook()
     }
 
     override fun onDestroy() {
@@ -1193,8 +1434,10 @@ class MainActivity : ComponentActivity() {
         val currentSheet = sheet ?: return
         val records = currentSheet.exportPersistedItems()
         val meta = NoteMetadata(
-            uuid = "default-notebook",
-            title = "Cuaderno S Pen Lab",
+            uuid = activeNotebookUuid,
+            title = activeNotebookTitle,
+            folderId = activeNotebookFolderId,
+            coverColorArgb = activeNotebookCoverColor,
             layoutMode = layoutMode,
             pageCount = currentSheet.pageCount,
             autoAddPage = autoAddPage,
@@ -1215,11 +1458,36 @@ class MainActivity : ComponentActivity() {
         saveExecutor.execute {
             NoteRepository.saveAtomically(dir, meta, records)
         }
+        persistSplitNotebook()
     }
 
-    private fun loadPersistedNotebook(view: PenSheet) {
-        val loaded = NoteRepository.load(filesDir, "default-notebook") ?: return
+    private fun persistSplitNotebook() {
+        val sUuid = splitNotebookUuid ?: return
+        val sView = splitSheet ?: return
+        val existingMeta = allNotebooks.firstOrNull { it.uuid == sUuid }
+        val records = sView.exportPersistedItems()
+        val meta = (existingMeta ?: NoteMetadata(uuid = sUuid, title = splitNotebookTitle)).copy(
+            pageCount = sView.pageCount,
+            viewScale = sView.viewScale,
+            panX = sView.panX,
+            panY = sView.panY,
+            activeLayerId = sView.activeLayerId,
+            layers = sView.layers.toList(),
+            updatedAtMs = System.currentTimeMillis()
+        )
+        val dir = filesDir
+        saveExecutor.execute {
+            NoteRepository.saveAtomically(dir, meta, records)
+        }
+    }
+
+    private fun loadPersistedNotebook(view: PenSheet, uuid: String = activeNotebookUuid) {
+        val loaded = NoteRepository.load(filesDir, uuid) ?: return
         val (meta, records) = loaded
+        activeNotebookUuid = meta.uuid
+        activeNotebookTitle = meta.title
+        activeNotebookFolderId = meta.folderId
+        activeNotebookCoverColor = meta.coverColorArgb
         layoutMode = meta.layoutMode
         autoAddPage = meta.autoAddPage
         paperStyle = meta.paperStyle
@@ -1230,9 +1498,138 @@ class MainActivity : ComponentActivity() {
         outlines.addAll(meta.outlines)
         comments.clear()
         comments.addAll(meta.comments)
-        view.importPersistedSession(meta, records)
+        view.importPersistedSession(
+            meta,
+            records,
+            imageLoader = { fileName -> loadNotebookImage(meta.uuid, fileName) }
+        )
         refreshActiveLayerName()
         minimapTrigger++
+    }
+
+    private fun refreshLibraryLists() {
+        allFolders.clear()
+        allFolders.addAll(NoteRepository.loadFolders(filesDir))
+        allNotebooks.clear()
+        allNotebooks.addAll(NoteRepository.listAllNotebooks(filesDir))
+        val cur = allNotebooks.firstOrNull { it.uuid == activeNotebookUuid } ?: allNotebooks.firstOrNull()
+        if (cur != null) {
+            activeNotebookUuid = cur.uuid
+            activeNotebookTitle = cur.title
+            activeNotebookFolderId = cur.folderId
+            activeNotebookCoverColor = cur.coverColorArgb
+        }
+    }
+
+    private fun switchActiveNotebook(targetUuid: String) {
+        if (targetUuid == activeNotebookUuid) return
+        performPersistToDisk()
+        val view = sheet ?: return
+        if (splitNotebookUuid == targetUuid) {
+            persistSplitNotebook()
+            splitNotebookUuid = null
+            splitSheet = null
+        }
+        loadPersistedNotebook(view, targetUuid)
+        refreshLibraryLists()
+    }
+
+    private fun createNewNotebook(
+        title: String,
+        mode: CanvasLayoutMode,
+        folderId: String?,
+        coverColorArgb: Int
+    ) {
+        performPersistToDisk()
+        val newUuid = "note-${System.currentTimeMillis()}"
+        val meta = NoteMetadata(
+            uuid = newUuid,
+            title = title,
+            folderId = folderId,
+            coverColorArgb = coverColorArgb,
+            layoutMode = mode,
+            pageCount = if (mode == CanvasLayoutMode.PAGED) 3 else 1
+        )
+        NoteRepository.saveAtomically(filesDir, meta, emptyList())
+        refreshLibraryLists()
+        sheet?.let { loadPersistedNotebook(it, newUuid) }
+    }
+
+    private fun openInSplitScreen(nb: NoteMetadata) {
+        if (nb.uuid == activeNotebookUuid) return
+        persistSplitNotebook()
+        splitNotebookUuid = nb.uuid
+        splitNotebookTitle = nb.title
+    }
+
+    private fun importPickedImage(uri: Uri) {
+        runCatching {
+            val rawBmp = contentResolver.openInputStream(uri)?.use { stream ->
+                BitmapFactory.decodeStream(stream)
+            } ?: return
+            val maxDim = 1280
+            val bmp = if (rawBmp.width > maxDim || rawBmp.height > maxDim) {
+                val ratio = kotlin.math.min(maxDim.toFloat() / rawBmp.width, maxDim.toFloat() / rawBmp.height)
+                Bitmap.createScaledBitmap(
+                    rawBmp,
+                    (rawBmp.width * ratio).toInt().coerceAtLeast(1),
+                    (rawBmp.height * ratio).toInt().coerceAtLeast(1),
+                    true
+                )
+            } else {
+                rawBmp
+            }
+            val dir = java.io.File(NoteRepository.noteDir(filesDir, activeNotebookUuid), "images").apply { mkdirs() }
+            val fileName = "img_${System.currentTimeMillis()}.png"
+            val destFile = java.io.File(dir, fileName)
+            java.io.FileOutputStream(destFile).use { fos ->
+                bmp.compress(Bitmap.CompressFormat.PNG, 95, fos)
+            }
+            sheet?.addImageItem(fileName, bmp)
+            scheduleAutoSave()
+            Toast.makeText(this, "Imagen insertada (usa Lazo para mover o escalar)", Toast.LENGTH_SHORT).show()
+        }.onFailure {
+            Toast.makeText(this, "No se pudo cargar la imagen seleccionada", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun loadNotebookImage(uuid: String, fileName: String): Bitmap? = runCatching {
+        val f = java.io.File(java.io.File(NoteRepository.noteDir(filesDir, uuid), "images"), fileName)
+        if (f.exists()) BitmapFactory.decodeFile(f.absolutePath) else null
+    }.getOrNull()
+
+    private fun handleActivateLink(link: PenSheet.LinkItem) {
+        when (link.targetKind) {
+            LinkTargetKind.PAGE -> {
+                val pageNum = link.targetValue.toIntOrNull() ?: 1
+                sheet?.jumpToPage((pageNum - 1).coerceAtLeast(0))
+                minimapTrigger++
+                Toast.makeText(this, "Saltando a Página $pageNum", Toast.LENGTH_SHORT).show()
+            }
+            LinkTargetKind.NOTEBOOK -> {
+                refreshLibraryLists()
+                val targetNb = allNotebooks.firstOrNull {
+                    it.uuid == link.targetValue || it.title.equals(link.targetValue, ignoreCase = true)
+                }
+                if (targetNb != null) {
+                    if (targetNb.uuid != activeNotebookUuid) {
+                        openInSplitScreen(targetNb)
+                        Toast.makeText(this, "Abierto en pantalla dividida: ${targetNb.title}", Toast.LENGTH_SHORT).show()
+                    }
+                } else {
+                    Toast.makeText(this, "Cuaderno enlazado no encontrado", Toast.LENGTH_SHORT).show()
+                }
+            }
+            LinkTargetKind.WEB_URL -> {
+                val rawUrl = link.targetValue.trim()
+                val fullUrl = if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) rawUrl else "https://$rawUrl"
+                runCatching {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(fullUrl)))
+                }.onFailure {
+                    Toast.makeText(this, "No se pudo abrir el enlace: $fullUrl", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
     }
 
     private fun currentIndicatorColor(): Color = when (activeTool) {
@@ -2301,6 +2698,123 @@ private fun DiagnosticsDialog(
         },
         confirmButton = {
             TextButton(onClick = onDismiss) { Text("Cerrar") }
+        }
+    )
+}
+
+@Composable
+private fun LinkEditorDialog(
+    existing: PenSheet.LinkItem?,
+    notebooks: List<NoteMetadata>,
+    totalPages: Int,
+    defaultColorArgb: Int,
+    onConfirm: (label: String, kind: LinkTargetKind, targetVal: String, colorArgb: Int) -> Unit,
+    onDelete: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var label by remember(existing) { mutableStateOf(existing?.label ?: "Ir a referencia") }
+    var kind by remember(existing) { mutableStateOf(existing?.targetKind ?: LinkTargetKind.PAGE) }
+    var targetVal by remember(existing) { mutableStateOf(existing?.targetValue ?: "1") }
+    var colorArgb by remember(existing) { mutableIntStateOf(existing?.color ?: defaultColorArgb) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = GraphiteSurface,
+        title = { Text(if (existing == null) "Nuevo hipervínculo (🔗)" else "Editar hipervínculo (🔗)") },
+        text = {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.verticalScroll(rememberScrollState())
+            ) {
+                OutlinedTextField(
+                    value = label,
+                    onValueChange = { label = it },
+                    label = { Text("Etiqueta visible en la hoja") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text("Destino del enlace:", style = MaterialTheme.typography.labelMedium, color = InkTextSecondary)
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    LinkTargetKind.entries.forEach { k ->
+                        FilterChip(
+                            selected = k == kind,
+                            onClick = {
+                                kind = k
+                                targetVal = when (k) {
+                                    LinkTargetKind.PAGE -> "1"
+                                    LinkTargetKind.NOTEBOOK -> notebooks.firstOrNull()?.uuid ?: "default-notebook"
+                                    LinkTargetKind.WEB_URL -> "https://es.wikipedia.org"
+                                }
+                            },
+                            label = { Text(k.label) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = PetroleumDeep,
+                                selectedLabelColor = InkTextPrimary
+                            )
+                        )
+                    }
+                }
+                when (kind) {
+                    LinkTargetKind.PAGE -> {
+                        OutlinedTextField(
+                            value = targetVal,
+                            onValueChange = { targetVal = it },
+                            label = { Text("Número de página (1 .. $totalPages)") },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                    LinkTargetKind.NOTEBOOK -> {
+                        Text(
+                            "Selecciona el cuaderno (se abrirá en pantalla dividida):",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = InkTextSecondary
+                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            notebooks.forEach { nb ->
+                                FilterChip(
+                                    selected = targetVal == nb.uuid,
+                                    onClick = {
+                                        targetVal = nb.uuid
+                                        if (label == "Ir a referencia") label = nb.title
+                                    },
+                                    label = { Text(nb.title) }
+                                )
+                            }
+                        }
+                    }
+                    LinkTargetKind.WEB_URL -> {
+                        OutlinedTextField(
+                            value = targetVal,
+                            onValueChange = { targetVal = it },
+                            label = { Text("Dirección URL (https://...)") },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+            }
+        },
+        dismissButton = {
+            Row {
+                if (existing != null) {
+                    TextButton(onClick = onDelete) {
+                        Text("Eliminar", color = Color(0xFFE06C75))
+                    }
+                }
+                TextButton(onClick = onDismiss) { Text("Cancelar") }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    onConfirm(label, kind, targetVal, colorArgb)
+                }
+            ) {
+                Text("Guardar enlace", color = Petroleum)
+            }
         }
     )
 }

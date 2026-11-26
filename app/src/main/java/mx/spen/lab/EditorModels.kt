@@ -10,9 +10,30 @@ enum class ToolMode(val label: String) {
     TAPE("Cinta"),
     SHAPES("Figuras"),
     TEXT("Texto"),
+    LINK("Enlace"),
     LASER("Láser"),
     ERASER("Borrar"),
     LASSO("Lazo")
+}
+
+/** Color-coded folder in the Notebook Library (Section 04 · 无限层级文件夹). */
+data class NotebookFolder(
+    val id: String,
+    val name: String,
+    val colorArgb: Int = 0xFF2AA1B7.toInt(),
+    val parentId: String? = null
+)
+
+/** Hyperlink target kind (Sections 20 & 21 · 双向链接 & 超链接). */
+enum class LinkTargetKind(val code: Int, val label: String) {
+    PAGE(1, "Página de este cuaderno"),
+    NOTEBOOK(2, "Otro cuaderno (o Pantalla dividida)"),
+    WEB_URL(3, "Enlace Web (URL)");
+
+    companion object {
+        fun fromCode(code: Int): LinkTargetKind =
+            entries.firstOrNull { it.code == code } ?: PAGE
+    }
 }
 
 enum class EraserMode(val label: String) {

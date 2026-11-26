@@ -85,6 +85,25 @@ class NoteCodecTest {
                 isBold = true,
                 isItalic = false,
                 isUnderline = true
+            ),
+            PersistedItem.ImageRecord(
+                id = 105L,
+                layerId = 1,
+                x = 300f,
+                y = 400f,
+                widthWorld = 220f,
+                heightWorld = 160f,
+                imageFileName = "img_12345.png"
+            ),
+            PersistedItem.LinkRecord(
+                id = 106L,
+                layerId = 1,
+                x = 450f,
+                y = 520f,
+                label = "Ver Formulario",
+                targetKind = LinkTargetKind.NOTEBOOK,
+                targetValue = "note-999",
+                color = 0xFF2AA1B7.toInt()
             )
         )
 
@@ -92,7 +111,7 @@ class NoteCodecTest {
         assertTrue(bytes.isNotEmpty())
 
         val decoded = NoteCodec.decodeItems(bytes)
-        assertEquals(4, decoded.size)
+        assertEquals(6, decoded.size)
 
         val ink = decoded[0] as PersistedItem.InkRecord
         assertEquals(101L, ink.id)
@@ -120,6 +139,15 @@ class NoteCodecTest {
         assertEquals("Física: E = mc²", txt.text)
         assertTrue(txt.isBold)
         assertTrue(txt.isUnderline)
+
+        val img = decoded[4] as PersistedItem.ImageRecord
+        assertEquals("img_12345.png", img.imageFileName)
+        assertEquals(220f, img.widthWorld, 1e-4f)
+
+        val lnk = decoded[5] as PersistedItem.LinkRecord
+        assertEquals("Ver Formulario", lnk.label)
+        assertEquals(LinkTargetKind.NOTEBOOK, lnk.targetKind)
+        assertEquals("note-999", lnk.targetValue)
     }
 
     @Test

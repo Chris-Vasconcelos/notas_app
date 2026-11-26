@@ -50,11 +50,34 @@ sealed interface PersistedItem {
         val isItalic: Boolean,
         val isUnderline: Boolean
     ) : PersistedItem
+
+    data class ImageRecord(
+        override val id: Long,
+        override val layerId: Int,
+        val x: Float,
+        val y: Float,
+        val widthWorld: Float,
+        val heightWorld: Float,
+        val imageFileName: String
+    ) : PersistedItem
+
+    data class LinkRecord(
+        override val id: Long,
+        override val layerId: Int,
+        val x: Float,
+        val y: Float,
+        val label: String,
+        val targetKind: LinkTargetKind,
+        val targetValue: String,
+        val color: Int
+    ) : PersistedItem
 }
 
 data class NoteMetadata(
     val uuid: String = "default-notebook",
     val title: String = "Cuaderno S Pen Lab",
+    val folderId: String? = null,
+    val coverColorArgb: Int = 0xFF2AA1B7.toInt(),
     val layoutMode: CanvasLayoutMode = CanvasLayoutMode.PAGED,
     val pageCount: Int = 3,
     val autoAddPage: Boolean = true,
@@ -79,6 +102,8 @@ object NoteCodec {
     private const val REC_INK = 1
     private const val REC_SHAPE = 2
     private const val REC_TEXT = 3
+    private const val REC_IMAGE = 4
+    private const val REC_LINK = 5
 
     private const val SHAPE_LINE = 1
     private const val SHAPE_WAVY = 2
@@ -195,6 +220,27 @@ object NoteCodec {
                 out.writeBoolean(item.isUnderline)
                 writeString(out, item.text)
             }
+            is PersistedItem.ImageRecord -> {
+                out.writeByte(REC_IMAGE)
+                out.writeLong(item.id)
+                out.writeInt(item.layerId)
+                out.writeFloat(item.x)
+                out.writeFloat(item.y)
+                out.writeFloat(item.widthWorld)
+                out.writeFloat(item.heightWorld)
+                writeString(out, item.imageFileName)
+            }
+            is PersistedItem.LinkRecord -> {
+                out.writeByte(REC_LINK)
+                out.writeLong(item.id)
+                out.writeInt(item.layerId)
+                out.writeFloat(item.x)
+                out.writeFloat(item.y)
+                out.writeInt(item.targetKind.code)
+                out.writeInt(item.color)
+                writeString(out, item.label)
+                writeString(out, item.targetValue)
+            }
         }
         out.flush()
         return baos.toByteArray()
@@ -282,6 +328,40 @@ object NoteCodec {
                     isBold = isBold,
                     isItalic = isItalic,
                     isUnderline = isUnderline
+                )
+            }
+            REC_IMAGE -> {
+                val x = inp.readFloat()
+                val y = inp.readFloat()
+                val widthWorld = inp.readFloat()
+                val heightWorld = inp.readFloat()
+                val fileName = readString(inp)
+                PersistedItem.ImageRecord(
+                    id = id,
+                    layerId = layerId,
+                    x = x,
+                    y = y,
+                    widthWorld = widthWorld,
+                    heightWorld = heightWorld,
+                    imageFileName = fileName
+                )
+            }
+            REC_LINK -> {
+                val x = inp.readFloat()
+                val y = inp.readFloat()
+                val targetKind = LinkTargetKind.fromCode(inp.readInt())
+                val color = inp.readInt()
+                val label = readString(inp)
+                val targetValue = readString(inp)
+                PersistedItem.LinkRecord(
+                    id = id,
+                    layerId = layerId,
+                    x = x,
+                    y = y,
+                    label = label,
+                    targetKind = targetKind,
+                    targetValue = targetValue,
+                    color = color
                 )
             }
             else -> null
@@ -525,6 +605,8 @@ object NoteRepository {
         val root = JSONObject()
         root.put("uuid", meta.uuid)
         root.put("title", meta.title)
+        if (meta.folderId != null) root.put("folderId", meta.folderId)
+        root.put("coverColorArgb", meta.coverColorArgb)
         root.put("layoutMode", meta.layoutMode.name)
         root.put("pageCount", meta.pageCount)
         root.put("autoAddPage", meta.autoAddPage)
@@ -651,6 +733,8 @@ object NoteRepository {
         return NoteMetadata(
             uuid = root.optString("uuid", "default-notebook"),
             title = root.optString("title", "Cuaderno S Pen Lab"),
+            folderId = if (root.has("folderId") && !root.isNull("folderId")) root.optString("folderId") else null,
+            coverColorArgb = root.optInt("coverColorArgb", 0xFF2AA1B7.toInt()),
             layoutMode = layoutMode,
             pageCount = root.optInt("pageCount", 3).coerceIn(1, 500),
             autoAddPage = root.optBoolean("autoAddPage", true),
@@ -667,5 +751,82 @@ object NoteRepository {
             comments = comments,
             updatedAtMs = root.optLong("updatedAtMs", System.currentTimeMillis())
         )
+    }
+
+    fun listAllNotebooks(filesDir: File): List<NoteMetadata> {
+        val notesRoot = File(filesDir, "notes")
+        if (!notesRoot.exists()) {
+            val defaultMeta = NoteMetadata(uuid = "default-notebook", title = "Cuaderno Principal")
+            saveAtomically(filesDir, defaultMeta, emptyList())
+            return listOf(defaultMeta)
+        }
+        val list = mutableListOf<NoteMetadata>()
+        notesRoot.listFiles()?.forEach { dir ->
+            if (dir.isDirectory) {
+                val jsonFile = File(dir, "note.json")
+                if (jsonFile.exists()) {
+                    runCatching { decodeMetadataJson(jsonFile.readText(StandardCharsets.UTF_8)) }
+                        .getOrNull()
+                        ?.let { list.add(it) }
+                }
+            }
+        }
+        if (list.isEmpty()) {
+            val defaultMeta = NoteMetadata(uuid = "default-notebook", title = "Cuaderno Principal")
+            saveAtomically(filesDir, defaultMeta, emptyList())
+            list.add(defaultMeta)
+        }
+        return list.sortedByDescending { it.updatedAtMs }
+    }
+
+    fun deleteNotebook(filesDir: File, uuid: String): Boolean {
+        val dir = File(File(filesDir, "notes"), uuid)
+        return if (dir.exists()) dir.deleteRecursively() else false
+    }
+
+    fun loadFolders(filesDir: File): List<NotebookFolder> {
+        val f = File(filesDir, "folders.json")
+        if (!f.exists()) {
+            val defaults = listOf(
+                NotebookFolder("f-escuela", "Universidad / STEM", 0xFF2AA1B7.toInt()),
+                NotebookFolder("f-proyectos", "Proyectos & Ideas", 0xFF6C4AB6.toInt()),
+                NotebookFolder("f-personal", "Personal", 0xFF1E7A56.toInt())
+            )
+            saveFolders(filesDir, defaults)
+            return defaults
+        }
+        return runCatching {
+            val arr = JSONArray(f.readText(StandardCharsets.UTF_8))
+            val out = mutableListOf<NotebookFolder>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                out.add(
+                    NotebookFolder(
+                        id = obj.optString("id", "f-$i"),
+                        name = obj.optString("name", "Carpeta"),
+                        colorArgb = obj.optInt("colorArgb", 0xFF2AA1B7.toInt()),
+                        parentId = if (obj.has("parentId") && !obj.isNull("parentId")) obj.optString("parentId") else null
+                    )
+                )
+            }
+            out
+        }.getOrDefault(emptyList())
+    }
+
+    fun saveFolders(filesDir: File, folders: List<NotebookFolder>) {
+        runCatching {
+            val arr = JSONArray()
+            for (folder in folders) {
+                arr.put(
+                    JSONObject().apply {
+                        put("id", folder.id)
+                        put("name", folder.name)
+                        put("colorArgb", folder.colorArgb)
+                        if (folder.parentId != null) put("parentId", folder.parentId)
+                    }
+                )
+            }
+            File(filesDir, "folders.json").writeText(arr.toString(2), StandardCharsets.UTF_8)
+        }
     }
 }

@@ -53,6 +53,8 @@ class PenSheet(
     private val onStateChanged: (canUndo: Boolean, canRedo: Boolean, hasSelection: Boolean) -> Unit,
     private val onTelemetryChanged: (PenTelemetry) -> Unit = {},
     private val onRequestTextBoxEditor: (existing: TextBoxItem?, worldX: Float, worldY: Float) -> Unit = { _, _, _ -> },
+    private val onRequestLinkEditor: (existing: LinkItem?, worldX: Float, worldY: Float) -> Unit = { _, _, _ -> },
+    private val onActivateLink: (LinkItem) -> Unit = {},
     private val onContentMutated: () -> Unit = {}
 ) : FrameLayout(context) {
 
@@ -212,6 +214,86 @@ class PenSheet(
         override fun withLayer(newLayerId: Int): TextBoxItem = copy(layerId = newLayerId)
 
         override fun equals(other: Any?): Boolean = (other is TextBoxItem) && other.id == id
+        override fun hashCode(): Int = id.hashCode()
+    }
+
+    data class ImageItem(
+        override val id: Long,
+        override val layerId: Int,
+        val x: Float,
+        val y: Float,
+        val widthWorld: Float,
+        val heightWorld: Float,
+        val imageFileName: String,
+        val bitmap: Bitmap?,
+        override val worldBounds: RectF
+    ) : CanvasItem {
+        override val isHighlighter: Boolean get() = false
+        override val isTape: Boolean get() = false
+
+        override fun translated(dx: Float, dy: Float, newId: Long): ImageItem {
+            val moved = RectF(worldBounds).apply { offset(dx, dy) }
+            return copy(id = newId, x = x + dx, y = y + dy, worldBounds = moved)
+        }
+
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float, newId: Long): ImageItem {
+            val nx = anchorX + (x - anchorX) * factor
+            val ny = anchorY + (y - anchorY) * factor
+            val nw = (widthWorld * factor).coerceIn(24f, 4000f)
+            val nh = (heightWorld * factor).coerceIn(24f, 4000f)
+            return copy(
+                id = newId,
+                x = nx,
+                y = ny,
+                widthWorld = nw,
+                heightWorld = nh,
+                worldBounds = RectF(nx, ny, nx + nw, ny + nh)
+            )
+        }
+
+        override fun recolored(newColor: Int): ImageItem = this
+        override fun withLayer(newLayerId: Int): ImageItem = copy(layerId = newLayerId)
+
+        override fun equals(other: Any?): Boolean = (other is ImageItem) && other.id == id
+        override fun hashCode(): Int = id.hashCode()
+    }
+
+    data class LinkItem(
+        override val id: Long,
+        override val layerId: Int,
+        val x: Float,
+        val y: Float,
+        val label: String,
+        val targetKind: LinkTargetKind,
+        val targetValue: String,
+        val color: Int,
+        override val worldBounds: RectF
+    ) : CanvasItem {
+        override val isHighlighter: Boolean get() = false
+        override val isTape: Boolean get() = false
+
+        override fun translated(dx: Float, dy: Float, newId: Long): LinkItem {
+            val moved = RectF(worldBounds).apply { offset(dx, dy) }
+            return copy(id = newId, x = x + dx, y = y + dy, worldBounds = moved)
+        }
+
+        override fun scaled(anchorX: Float, anchorY: Float, factor: Float, newId: Long): LinkItem {
+            val nx = anchorX + (x - anchorX) * factor
+            val ny = anchorY + (y - anchorY) * factor
+            val bw = worldBounds.width() * factor
+            val bh = worldBounds.height() * factor
+            return copy(
+                id = newId,
+                x = nx,
+                y = ny,
+                worldBounds = RectF(nx, ny, nx + bw, ny + bh)
+            )
+        }
+
+        override fun recolored(newColor: Int): LinkItem = copy(color = newColor)
+        override fun withLayer(newLayerId: Int): LinkItem = copy(layerId = newLayerId)
+
+        override fun equals(other: Any?): Boolean = (other is LinkItem) && other.id == id
         override fun hashCode(): Int = id.hashCode()
     }
 
@@ -580,6 +662,8 @@ class PenSheet(
                 is InkItem -> item.data.color
                 is ShapeItem -> item.color
                 is TextBoxItem -> item.color
+                is ImageItem -> 0xFF2AA1B7.toInt()
+                is LinkItem -> item.color
             }
             item.worldBounds to col
         }
@@ -1072,11 +1156,64 @@ class PenSheet(
             is TextBoxItem -> {
                 drawTextBoxItem(canvas, item)
             }
+            is ImageItem -> {
+                drawImageItem(canvas, item)
+            }
+            is LinkItem -> {
+                drawLinkItem(canvas, item)
+            }
         }
 
         if (applyTempDrag || applyTempScale) {
             canvas.restore()
         }
+    }
+
+    private fun drawImageItem(canvas: Canvas, item: ImageItem) {
+        val bmp = item.bitmap
+        if (bmp != null && !bmp.isRecycled) {
+            canvas.drawBitmap(bmp, null, item.worldBounds, paint)
+        } else {
+            fillPaint.color = Color.argb(60, 42, 161, 183)
+            canvas.drawRoundRect(item.worldBounds, 8f, 8f, fillPaint)
+            shapePaint.color = Color.rgb(42, 161, 183)
+            shapePaint.strokeWidth = 2f * density / viewScale
+            canvas.drawRoundRect(item.worldBounds, 8f, 8f, shapePaint)
+        }
+    }
+
+    private fun drawLinkItem(canvas: Canvas, item: LinkItem) {
+        val b = item.worldBounds
+        val corner = 12f * density / viewScale
+        fillPaint.color = Color.argb(
+            48,
+            Color.red(item.color),
+            Color.green(item.color),
+            Color.blue(item.color)
+        )
+        canvas.drawRoundRect(b, corner, corner, fillPaint)
+
+        shapePaint.color = item.color
+        shapePaint.strokeWidth = 1.6f * density / viewScale
+        canvas.drawRoundRect(b, corner, corner, shapePaint)
+
+        val fontSize = (13.5f * density) / viewScale
+        textPaint.color = item.color
+        textPaint.textSize = fontSize
+        textPaint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        textPaint.isUnderlineText = true
+        val prefix = when (item.targetKind) {
+            LinkTargetKind.PAGE -> "🔗 Pág: "
+            LinkTargetKind.NOTEBOOK -> "🔗 Nota: "
+            LinkTargetKind.WEB_URL -> "🌐 "
+        }
+        canvas.drawText(
+            prefix + item.label,
+            b.left + 8f * density / viewScale,
+            b.centerY() + fontSize * 0.35f,
+            textPaint
+        )
+        textPaint.isUnderlineText = false
     }
 
     private fun drawTextBoxItem(canvas: Canvas, item: TextBoxItem) {
@@ -1546,6 +1683,9 @@ class PenSheet(
                     if (!singleFingerMoved) {
                         val ux = event.getX(index)
                         val uy = event.getY(index)
+                        if (activateLinkAtScreen(ux, uy)) {
+                            return true
+                        }
                         if (!toggleTapeAtScreen(ux, uy)) {
                             val now = SystemClock.uptimeMillis()
                             if (doubleTapFitPage &&
@@ -1623,13 +1763,16 @@ class PenSheet(
         if (isWriting || isTwoFingerGesturing || singleFingerMoved) return
         val wx = screenToWorldX(singleFingerStartX)
         val wy = screenToWorldY(singleFingerStartY)
-        // Find topmost unlocked TextBoxItem or ShapeItem under long-press
+        // Find topmost unlocked item under long-press
         for (i in items.indices.reversed()) {
             val item = items[i]
             if (!isLayerVisible(item.layerId) || isLayerLocked(item.layerId)) continue
             if (item.worldBounds.contains(wx, wy)) {
                 if (item is TextBoxItem) {
                     onRequestTextBoxEditor(item, item.x, item.y)
+                    return
+                } else if (item is LinkItem) {
+                    onRequestLinkEditor(item, item.x, item.y)
                     return
                 } else {
                     toolMode = ToolMode.LASSO
@@ -1745,6 +1888,17 @@ class PenSheet(
                 it is TextBoxItem && isLayerVisible(it.layerId) && !isLayerLocked(it.layerId) && it.worldBounds.contains(wx, wy)
             } as? TextBoxItem
             onRequestTextBoxEditor(hitText, wx, wy)
+            endPen()
+            return
+        }
+
+        if (toolMode == ToolMode.LINK) {
+            val wx = screenToWorldX(x)
+            val wy = screenToWorldY(y)
+            val hitLink = items.lastOrNull {
+                it is LinkItem && isLayerVisible(it.layerId) && !isLayerLocked(it.layerId) && it.worldBounds.contains(wx, wy)
+            } as? LinkItem
+            onRequestLinkEditor(hitLink, wx, wy)
             endPen()
             return
         }
@@ -2159,6 +2313,19 @@ class PenSheet(
         return false
     }
 
+    private fun activateLinkAtScreen(sx: Float, sy: Float): Boolean {
+        val wx = screenToWorldX(sx)
+        val wy = screenToWorldY(sy)
+        for (i in items.indices.reversed()) {
+            val item = items[i]
+            if (item is LinkItem && isLayerVisible(item.layerId) && item.worldBounds.contains(wx, wy)) {
+                onActivateLink(item)
+                return true
+            }
+        }
+        return false
+    }
+
     private fun scheduleHoldCheck(sx: Float, sy: Float) {
         holdAnchorX = sx
         holdAnchorY = sy
@@ -2247,7 +2414,7 @@ class PenSheet(
                             hypot(pt.x - px, pt.y - py) <= threshold
                         }
                     }
-                    is TextBoxItem -> b.contains(px, py)
+                    is TextBoxItem, is ImageItem, is LinkItem -> b.contains(px, py)
                 }
                 if (hit) erasedIds.add(item.id)
             }
@@ -2375,7 +2542,7 @@ class PenSheet(
             val allowedByType = when (item) {
                 is InkItem -> lassoSelectInk
                 is ShapeItem -> lassoSelectShapes
-                is TextBoxItem -> lassoSelectText
+                is TextBoxItem, is ImageItem, is LinkItem -> lassoSelectText
             }
             if (!allowedByType) continue
 
@@ -2511,6 +2678,88 @@ class PenSheet(
         emitState()
     }
 
+    /** Inserts an image item on the canvas at the current viewport center (Section 01 · 插入图片). */
+    fun addImageItem(fileName: String, bmp: Bitmap) {
+        rememberBeforeChange()
+        val cx = (width.coerceAtLeast(1) * 0.5f - panX) / viewScale
+        val cy = (height.coerceAtLeast(1) * 0.5f - panY) / viewScale
+        val maxTargetW = (220f * density) / viewScale
+        val aspect = bmp.height.toFloat().coerceAtLeast(1f) / bmp.width.toFloat().coerceAtLeast(1f)
+        val wWorld = maxTargetW
+        val hWorld = (wWorld * aspect).coerceIn(36f, 2400f)
+        val x0 = cx - wWorld * 0.5f
+        val y0 = cy - hWorld * 0.5f
+        items.add(
+            ImageItem(
+                id = allocateId(),
+                layerId = activeLayerId,
+                x = x0,
+                y = y0,
+                widthWorld = wWorld,
+                heightWorld = hWorld,
+                imageFileName = fileName,
+                bitmap = bmp,
+                worldBounds = RectF(x0, y0, x0 + wWorld, y0 + hWorld)
+            )
+        )
+        dryInk.invalidate()
+        emitState()
+    }
+
+    /** Adds or updates a bidirectional / page / web hyperlink badge (Sections 20 & 21 · 双向链接 & 超链接). */
+    fun addOrUpdateLinkItem(
+        existingId: Long?,
+        worldX: Float,
+        worldY: Float,
+        label: String,
+        targetKind: LinkTargetKind,
+        targetValue: String,
+        color: Int
+    ) {
+        val trimmed = label.trim()
+        if (trimmed.isEmpty()) {
+            if (existingId != null) {
+                rememberBeforeChange()
+                items.removeAll { it.id == existingId }
+                dryInk.invalidate()
+                emitState()
+            }
+            return
+        }
+        rememberBeforeChange()
+        val fontSize = (13.5f * density) / viewScale
+        textPaint.textSize = fontSize
+        textPaint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        val prefix = when (targetKind) {
+            LinkTargetKind.PAGE -> "🔗 Pág: "
+            LinkTargetKind.NOTEBOOK -> "🔗 Nota: "
+            LinkTargetKind.WEB_URL -> "🌐 "
+        }
+        val textW = textPaint.measureText(prefix + trimmed)
+        val padX = 16f * density / viewScale
+        val badgeH = 28f * density / viewScale
+        val bounds = RectF(worldX, worldY, worldX + textW + padX, worldY + badgeH)
+        val newItem = LinkItem(
+            id = existingId ?: allocateId(),
+            layerId = activeLayerId,
+            x = worldX,
+            y = worldY,
+            label = trimmed,
+            targetKind = targetKind,
+            targetValue = targetValue.trim(),
+            color = color,
+            worldBounds = bounds
+        )
+        val idx = if (existingId != null) items.indexOfFirst { it.id == existingId } else -1
+        if (idx >= 0) {
+            items[idx] = newItem
+        } else {
+            items.add(newItem)
+        }
+        dryInk.invalidate()
+        emitState()
+    }
+
     // Layer management operations (Section 19 · 图层)
     fun addLayer(name: String): NoteLayer {
         val newId = (layers.maxOfOrNull { it.id } ?: 0) + 1
@@ -2582,6 +2831,8 @@ class PenSheet(
                 is InkItem -> item.data.color
                 is ShapeItem -> item.color
                 is TextBoxItem -> item.color
+                is ImageItem -> 0xFF2AA1B7.toInt()
+                is LinkItem -> item.color
             }
             item.worldBounds to col
         }
@@ -2808,11 +3059,34 @@ class PenSheet(
                 isItalic = item.isItalic,
                 isUnderline = item.isUnderline
             )
+            is ImageItem -> PersistedItem.ImageRecord(
+                id = item.id,
+                layerId = item.layerId,
+                x = item.x,
+                y = item.y,
+                widthWorld = item.widthWorld,
+                heightWorld = item.heightWorld,
+                imageFileName = item.imageFileName
+            )
+            is LinkItem -> PersistedItem.LinkRecord(
+                id = item.id,
+                layerId = item.layerId,
+                x = item.x,
+                y = item.y,
+                label = item.label,
+                targetKind = item.targetKind,
+                targetValue = item.targetValue,
+                color = item.color
+            )
         }
     }
 
     /** Restores canvas items and camera/layer state on the UI thread. */
-    fun importPersistedSession(meta: NoteMetadata, records: List<PersistedItem>) {
+    fun importPersistedSession(
+        meta: NoteMetadata,
+        records: List<PersistedItem>,
+        imageLoader: (String) -> Bitmap? = { null }
+    ) {
         undoHistory.clear()
         redoHistory.clear()
         selectedIds.clear()
@@ -2894,6 +3168,50 @@ class PenSheet(
                             isBold = rec.isBold,
                             isItalic = rec.isItalic,
                             isUnderline = rec.isUnderline,
+                            worldBounds = bounds
+                        )
+                    )
+                }
+                is PersistedItem.ImageRecord -> {
+                    val bmp = imageLoader(rec.imageFileName)
+                    val bounds = RectF(rec.x, rec.y, rec.x + rec.widthWorld, rec.y + rec.heightWorld)
+                    items.add(
+                        ImageItem(
+                            id = rec.id,
+                            layerId = rec.layerId,
+                            x = rec.x,
+                            y = rec.y,
+                            widthWorld = rec.widthWorld,
+                            heightWorld = rec.heightWorld,
+                            imageFileName = rec.imageFileName,
+                            bitmap = bmp,
+                            worldBounds = bounds
+                        )
+                    )
+                }
+                is PersistedItem.LinkRecord -> {
+                    val fontSize = (13.5f * density) / viewScale
+                    textPaint.textSize = fontSize
+                    textPaint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                    val prefix = when (rec.targetKind) {
+                        LinkTargetKind.PAGE -> "🔗 Pág: "
+                        LinkTargetKind.NOTEBOOK -> "🔗 Nota: "
+                        LinkTargetKind.WEB_URL -> "🌐 "
+                    }
+                    val textW = textPaint.measureText(prefix + rec.label)
+                    val padX = 16f * density / viewScale
+                    val badgeH = 28f * density / viewScale
+                    val bounds = RectF(rec.x, rec.y, rec.x + textW + padX, rec.y + badgeH)
+                    items.add(
+                        LinkItem(
+                            id = rec.id,
+                            layerId = rec.layerId,
+                            x = rec.x,
+                            y = rec.y,
+                            label = rec.label,
+                            targetKind = rec.targetKind,
+                            targetValue = rec.targetValue,
+                            color = rec.color,
                             worldBounds = bounds
                         )
                     )
