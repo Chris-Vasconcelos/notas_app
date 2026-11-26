@@ -77,11 +77,18 @@ data class PenPreset(
 internal fun TopEditorBar(
     title: String,
     zoomPercent: Int,
+    currentPage: Int,
+    totalPages: Int,
+    layoutMode: CanvasLayoutMode,
     activeLayerName: String,
     rulerEnabled: Boolean,
     onToggleRuler: () -> Unit,
     minimapOpen: Boolean,
     onToggleMinimap: () -> Unit,
+    gridViewOpen: Boolean,
+    onToggleGridView: () -> Unit,
+    rightSidebarOpen: Boolean,
+    onToggleRightSidebar: () -> Unit,
     onOpenLayers: () -> Unit,
     readingMode: Boolean,
     onToggleReadingMode: () -> Unit,
@@ -123,20 +130,23 @@ internal fun TopEditorBar(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
+            val pageBadge = if (layoutMode == CanvasLayoutMode.PAGED) "Pág $currentPage/$totalPages" else "Infinito"
             Text(
-                if (readingMode) "${zoomPercent}% · Lectura · $activeLayerName"
-                else "${zoomPercent}% · $activeLayerName",
+                if (readingMode) "${zoomPercent}% · $pageBadge · Lectura · $activeLayerName"
+                else "${zoomPercent}% · $pageBadge · $activeLayerName",
                 style = MaterialTheme.typography.labelSmall,
                 color = if (readingMode) Mint else InkTextSecondary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
         }
+        HeaderButton("Cuadrícula de páginas", EditorGlyph.Grid, active = gridViewOpen, action = onToggleGridView)
         HeaderButton("Deshacer", EditorGlyph.Undo, enabled = canUndo, action = onUndo)
         HeaderButton("Rehacer", EditorGlyph.Redo, enabled = canRedo, action = onRedo)
         HeaderButton("Regla virtual", EditorGlyph.Ruler, active = rulerEnabled, action = onToggleRuler)
         HeaderButton("Capas", EditorGlyph.Layers, action = onOpenLayers)
         HeaderButton("Minimapa de lienzo infinito", EditorGlyph.Minimap, active = minimapOpen, action = onToggleMinimap)
+        HeaderButton("Panel lateral (Páginas / Esquema / Notas)", EditorGlyph.Sidebar, active = rightSidebarOpen, action = onToggleRightSidebar)
         HeaderButton(
             label = if (readingMode) "Pasar a modo escritura" else "Modo lectura",
             glyph = EditorGlyph.Reading,
@@ -959,7 +969,7 @@ private fun glyphForTool(tool: ToolMode): EditorGlyph = when (tool) {
 
 private enum class EditorGlyph {
     Pen, Ballpoint, Dashed, Marker, Tape, Shapes, Text, Laser, Eraser, Lasso,
-    Ruler, Layers, Minimap, Swatch, Undo, Redo, Reading, Focus, Menu
+    Ruler, Layers, Minimap, Grid, Sidebar, Swatch, Undo, Redo, Reading, Focus, Menu
 }
 
 @Composable
@@ -1037,6 +1047,16 @@ private fun DrawGlyph(glyph: EditorGlyph, tint: Color, swatch: Color = Color.Tra
                     drawRoundRect(tint, Offset(3f, 4f), Size(18f, 16f), CornerRadius(2f), style = outline)
                     drawRoundRect(tint, Offset(11f, 10f), Size(7f, 6f), CornerRadius(1f), style = outline)
                 }
+                EditorGlyph.Grid -> {
+                    drawRoundRect(tint, Offset(4f, 4f), Size(6.5f, 6.5f), CornerRadius(1.5f), style = outline)
+                    drawRoundRect(tint, Offset(13.5f, 4f), Size(6.5f, 6.5f), CornerRadius(1.5f), style = outline)
+                    drawRoundRect(tint, Offset(4f, 13.5f), Size(6.5f, 6.5f), CornerRadius(1.5f), style = outline)
+                    drawRoundRect(tint, Offset(13.5f, 13.5f), Size(6.5f, 6.5f), CornerRadius(1.5f), style = outline)
+                }
+                EditorGlyph.Sidebar -> {
+                    drawRoundRect(tint, Offset(3f, 4f), Size(18f, 16f), CornerRadius(2f), style = outline)
+                    lines(listOf(Offset(15f, 4f), Offset(15f, 20f)))
+                }
                 EditorGlyph.Swatch -> {
                     drawCircle(swatch, 6.5f, Offset(12f, 12f))
                     drawCircle(tint, 8.5f, Offset(12f, 12f), style = outline)
@@ -1063,6 +1083,435 @@ private fun DrawGlyph(glyph: EditorGlyph, tint: Color, swatch: Color = Color.Tra
                 }
                 EditorGlyph.Menu -> {
                     for (x in listOf(6f, 12f, 18f)) drawCircle(tint, 1.35f, Offset(x, 12f))
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Right Sidebar Drawer (Section 17 · 右侧边栏):
+ * - Tab 0: Overview / Pages ("页面概览")
+ * - Tab 1: Outline / Bookmarks ("大纲")
+ * - Tab 2: Comments / Annotations ("备注")
+ */
+@Composable
+internal fun RightOverviewSidebar(
+    currentPageIndex: Int,
+    pageCount: Int,
+    layoutMode: CanvasLayoutMode,
+    isDarkPaper: Boolean,
+    outlines: List<OutlineEntry>,
+    comments: List<CommentEntry>,
+    pageSnapshotProvider: (pageIdx: Int) -> Pair<RectF, List<Pair<RectF, Int>>>,
+    onJumpToPage: (Int) -> Unit,
+    onInsertPageAfter: (Int) -> Unit,
+    onDuplicatePage: (Int) -> Unit,
+    onDeletePage: (Int) -> Unit,
+    onAddOutlineForCurrentPage: () -> Unit,
+    onJumpToOutline: (OutlineEntry) -> Unit,
+    onIndentOutline: (OutlineEntry, Int) -> Unit,
+    onDeleteOutline: (OutlineEntry) -> Unit,
+    onAddCommentForCurrentPage: () -> Unit,
+    onJumpToComment: (CommentEntry) -> Unit,
+    onDeleteComment: (CommentEntry) -> Unit,
+    onOpenGridView: () -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var activeTab by remember { mutableStateOf(0) } // 0=Páginas, 1=Esquema, 2=Notas
+
+    Surface(
+        color = GraphiteSurface.copy(alpha = 0.98f),
+        shape = RoundedCornerShape(topStart = 18.dp, bottomStart = 18.dp),
+        border = BorderStroke(1.dp, GraphiteBorder),
+        shadowElevation = 16.dp,
+        modifier = modifier.width(268.dp)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Vista general",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = InkTextPrimary,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = onClose) {
+                    Text("×", style = MaterialTheme.typography.titleMedium, color = InkTextSecondary)
+                }
+            }
+
+            // 3 Tabs: Páginas (页面概览) | Esquema (大纲) | Notas (备注)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                listOf("Páginas", "Esquema", "Notas").forEachIndexed { idx, label ->
+                    val sel = activeTab == idx
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (sel) ActiveTile else GraphiteBg)
+                            .clickable { activeTab = idx }
+                            .padding(vertical = 6.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            label,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (sel) Mint else InkTextSecondary
+                        )
+                    }
+                }
+            }
+
+            Text(
+                text = if (layoutMode == CanvasLayoutMode.PAGED) "$pageCount páginas en total" else "Modo Lienzo Infinito",
+                style = MaterialTheme.typography.labelSmall,
+                color = InkTextSecondary,
+                modifier = Modifier.padding(bottom = 6.dp)
+            )
+
+            Column(
+                modifier = Modifier
+                    .weight(1f, fill = false)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                when (activeTab) {
+                    0 -> {
+                        for (p in 0 until pageCount) {
+                            val isCurrent = p == currentPageIndex
+                            val (pageRect, miniItems) = pageSnapshotProvider(p)
+                            Surface(
+                                color = if (isCurrent) ActiveTile else GraphiteBg,
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(
+                                    width = if (isCurrent) 1.5.dp else 1.dp,
+                                    color = if (isCurrent) Mint else GraphiteBorder
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onJumpToPage(p) }
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(8.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .width(106.dp)
+                                            .height(142.dp)
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(if (isDarkPaper) Color(0xFF16191F) else Color(0xFFFDFEFF))
+                                            .border(1.dp, GraphiteBorder, RoundedCornerShape(6.dp))
+                                    ) {
+                                        Canvas(Modifier.matchParentSize()) {
+                                            val pw = max(1f, pageRect.width())
+                                            val ph = max(1f, pageRect.height())
+                                            for ((r, argb) in miniItems) {
+                                                val l = ((r.left - pageRect.left) / pw) * size.width
+                                                val t = ((r.top - pageRect.top) / ph) * size.height
+                                                val rr = ((r.right - pageRect.left) / pw) * size.width
+                                                val bb = ((r.bottom - pageRect.top) / ph) * size.height
+                                                drawRect(
+                                                    color = Color(argb),
+                                                    topLeft = Offset(l.coerceIn(0f, size.width), t.coerceIn(0f, size.height)),
+                                                    size = Size(max(2f, rr - l), max(2f, bb - t))
+                                                )
+                                            }
+                                        }
+                                    }
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(top = 4.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            "Pág ${p + 1}",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = if (isCurrent) Mint else InkTextPrimary
+                                        )
+                                        Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                                            Text(
+                                                "+",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                color = Mint,
+                                                modifier = Modifier
+                                                    .clickable { onInsertPageAfter(p) }
+                                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                                            )
+                                            Text(
+                                                "⧉",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                color = InkTextSecondary,
+                                                modifier = Modifier
+                                                    .clickable { onDuplicatePage(p) }
+                                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                                            )
+                                            if (pageCount > 1) {
+                                                Text(
+                                                    "🗑",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = Color(0xFFE06C75),
+                                                    modifier = Modifier
+                                                        .clickable { onDeletePage(p) }
+                                                        .padding(horizontal = 4.dp, vertical = 2.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    1 -> {
+                        TextButton(onClick = onAddOutlineForCurrentPage) {
+                            Text("+ Agregar marcador en Pág ${currentPageIndex + 1}", color = Mint)
+                        }
+                        if (outlines.isEmpty()) {
+                            Text(
+                                "Sin esquema todavía. Agrega títulos o capítulos para saltar rápido.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = InkTextSecondary
+                            )
+                        } else {
+                            outlines.forEach { item ->
+                                Surface(
+                                    color = GraphiteBg,
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, GraphiteBorder),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(start = (item.indentLevel * 12).dp)
+                                        .clickable { onJumpToOutline(item) }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(Modifier.weight(1f)) {
+                                            Text(item.title, style = MaterialTheme.typography.bodySmall, color = InkTextPrimary)
+                                            Text("Pág ${item.pageIndex + 1}", style = MaterialTheme.typography.labelSmall, color = Mint)
+                                        }
+                                        if (item.indentLevel > 0) {
+                                            Text(
+                                                "←",
+                                                color = InkTextSecondary,
+                                                modifier = Modifier
+                                                    .clickable { onIndentOutline(item, -1) }
+                                                    .padding(horizontal = 4.dp)
+                                            )
+                                        }
+                                        if (item.indentLevel < 5) {
+                                            Text(
+                                                "→",
+                                                color = InkTextSecondary,
+                                                modifier = Modifier
+                                                    .clickable { onIndentOutline(item, 1) }
+                                                    .padding(horizontal = 4.dp)
+                                            )
+                                        }
+                                        Text(
+                                            "×",
+                                            color = Color(0xFFE06C75),
+                                            modifier = Modifier
+                                                .clickable { onDeleteOutline(item) }
+                                                .padding(horizontal = 4.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    2 -> {
+                        TextButton(onClick = onAddCommentForCurrentPage) {
+                            Text("+ Agregar nota/comentario en Pág ${currentPageIndex + 1}", color = Mint)
+                        }
+                        if (comments.isEmpty()) {
+                            Text(
+                                "Sin comentarios en el documento.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = InkTextSecondary
+                            )
+                        } else {
+                            comments.forEach { c ->
+                                Surface(
+                                    color = GraphiteBg,
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, GraphiteBorder),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { onJumpToComment(c) }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(8.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(Modifier.weight(1f)) {
+                                            Text("Pág ${c.pageIndex + 1}", style = MaterialTheme.typography.labelSmall, color = Mint)
+                                            Text(c.text, style = MaterialTheme.typography.bodySmall, color = InkTextPrimary)
+                                        }
+                                        Text(
+                                            "×",
+                                            color = Color(0xFFE06C75),
+                                            modifier = Modifier
+                                                .clickable { onDeleteComment(c) }
+                                                .padding(horizontal = 4.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            HorizontalDivider(color = GraphiteBorder, modifier = Modifier.padding(vertical = 6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TextButton(onClick = onOpenGridView) {
+                    Text("⊞ Miniaturas en cuadrícula", style = MaterialTheme.typography.labelMedium, color = Mint)
+                }
+                TextButton(onClick = { onInsertPageAfter(pageCount - 1) }) {
+                    Text("+ Pág", style = MaterialTheme.typography.labelMedium, color = InkTextPrimary)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Full-screen Bird's-Eye Page Grid Modal (Sections 18 & 23 · 平铺缩略图).
+ */
+@Composable
+internal fun PageGridModal(
+    currentPageIndex: Int,
+    pageCount: Int,
+    isDarkPaper: Boolean,
+    pageSnapshotProvider: (pageIdx: Int) -> Pair<RectF, List<Pair<RectF, Int>>>,
+    onJumpToPage: (Int) -> Unit,
+    onInsertPageAfter: (Int) -> Unit,
+    onDuplicatePage: (Int) -> Unit,
+    onDeletePage: (Int) -> Unit,
+    onClose: () -> Unit
+) {
+    Surface(
+        color = GraphiteBg.copy(alpha = 0.98f),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Cuadrícula de páginas ($pageCount)",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = InkTextPrimary,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = { onInsertPageAfter(pageCount - 1) }) {
+                    Text("+ Nueva página", color = Mint)
+                }
+                TextButton(onClick = onClose) {
+                    Text("Cerrar")
+                }
+            }
+            Column(
+                modifier = Modifier
+                    .padding(top = 8.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                (0 until pageCount).chunked(3).forEach { rowPages ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        rowPages.forEach { p ->
+                            val isCurrent = p == currentPageIndex
+                            val (pageRect, miniItems) = pageSnapshotProvider(p)
+                            Surface(
+                                color = if (isCurrent) ActiveTile else GraphiteSurface,
+                                shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(
+                                    width = if (isCurrent) 2.dp else 1.dp,
+                                    color = if (isCurrent) Mint else GraphiteBorder
+                                ),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable {
+                                        onJumpToPage(p)
+                                        onClose()
+                                    }
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(10.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(132.dp)
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(if (isDarkPaper) Color(0xFF16191F) else Color(0xFFFDFEFF))
+                                            .border(1.dp, GraphiteBorder, RoundedCornerShape(8.dp))
+                                    ) {
+                                        Canvas(Modifier.matchParentSize()) {
+                                            val pw = max(1f, pageRect.width())
+                                            val ph = max(1f, pageRect.height())
+                                            for ((r, argb) in miniItems) {
+                                                val l = ((r.left - pageRect.left) / pw) * size.width
+                                                val t = ((r.top - pageRect.top) / ph) * size.height
+                                                val rr = ((r.right - pageRect.left) / pw) * size.width
+                                                val bb = ((r.bottom - pageRect.top) / ph) * size.height
+                                                drawRect(
+                                                    color = Color(argb),
+                                                    topLeft = Offset(l.coerceIn(0f, size.width), t.coerceIn(0f, size.height)),
+                                                    size = Size(max(2f, rr - l), max(2f, bb - t))
+                                                )
+                                            }
+                                        }
+                                    }
+                                    Text(
+                                        "Página ${p + 1}",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = if (isCurrent) Mint else InkTextPrimary,
+                                        modifier = Modifier.padding(top = 6.dp)
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Text(
+                                            "⧉",
+                                            color = InkTextSecondary,
+                                            modifier = Modifier
+                                                .clickable { onDuplicatePage(p) }
+                                                .padding(4.dp)
+                                        )
+                                        if (pageCount > 1) {
+                                            Text(
+                                                "🗑",
+                                                color = Color(0xFFE06C75),
+                                                modifier = Modifier
+                                                    .clickable { onDeletePage(p) }
+                                                    .padding(4.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        repeat(3 - rowPages.size) {
+                            Box(Modifier.weight(1f))
+                        }
+                    }
                 }
             }
         }

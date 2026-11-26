@@ -31,7 +31,7 @@ jobs:
       - name: Build Debug APK
         run: |
           set -o pipefail
-          ./gradlew :app:assembleDebug --console=plain 2>&1 | tee build.log
+          ./gradlew :app:testDebugUnitTest :app:assembleDebug --console=plain 2>&1 | tee build.log
 
       - name: Upload APK artifact
         if: success()

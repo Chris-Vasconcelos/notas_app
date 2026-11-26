@@ -26,23 +26,34 @@ enum class LassoMode(val label: String) {
     RECTANGLE("Rectangular")
 }
 
-enum class DirectShapeKind(val label: String, val is3D: Boolean = false) {
-    AUTO("Auto (1 trazo)"),
-    LINE("Recta"),
-    WAVY("Ondulada"),
-    ARROW("Flecha"),
-    AXES("Ejes X-Y"),
-    PARABOLA("Parábola"),
-    RECTANGLE("Rectángulo"),
-    TRIANGLE("Triángulo"),
-    DIAMOND("Rombo"),
-    PENTAGON("Pentágono"),
-    STAR("Estrella"),
-    ELLIPSE("Círculo / Elipse"),
-    CUBE("Cubo 3D", is3D = true),
-    CYLINDER("Cilindro 3D", is3D = true),
-    CONE("Cono 3D", is3D = true),
-    SPHERE("Esfera 3D", is3D = true)
+enum class DirectShapeKind(val code: Int, val label: String, val is3D: Boolean = false) {
+    AUTO(0, "Auto (1 trazo)"),
+    LINE(1, "Recta"),
+    WAVY(2, "Ondulada"),
+    ARROW(3, "Flecha"),
+    AXES(4, "Ejes X-Y"),
+    PARABOLA(5, "Parábola"),
+    RECTANGLE(6, "Rectángulo"),
+    TRIANGLE(7, "Triángulo"),
+    DIAMOND(8, "Rombo"),
+    PENTAGON(9, "Pentágono"),
+    STAR(10, "Estrella"),
+    ELLIPSE(11, "Círculo / Elipse"),
+    CUBE(12, "Cubo 3D", is3D = true),
+    CYLINDER(13, "Cilindro 3D", is3D = true),
+    CONE(14, "Cono 3D", is3D = true),
+    SPHERE(15, "Esfera 3D", is3D = true);
+
+    companion object {
+        fun fromCode(code: Int): DirectShapeKind =
+            entries.firstOrNull { it.code == code } ?: AUTO
+    }
+}
+
+/** Canvas layout mode (Sections 01, 03 & Page Settings). */
+enum class CanvasLayoutMode(val label: String) {
+    PAGED("Paginado A4"),
+    INFINITE("Lienzo infinito")
 }
 
 data class NoteLayer(
@@ -50,6 +61,26 @@ data class NoteLayer(
     val name: String,
     val visible: Boolean = true,
     val locked: Boolean = false
+)
+
+/** Outline / bookmark item in the Right Sidebar (Section 17 · 大纲). */
+data class OutlineEntry(
+    val id: Long,
+    val title: String,
+    val pageIndex: Int,
+    val worldX: Float,
+    val worldY: Float,
+    val indentLevel: Int = 0
+)
+
+/** Annotation / comment item in the Right Sidebar (Section 17 · 备注). */
+data class CommentEntry(
+    val id: Long,
+    val text: String,
+    val pageIndex: Int,
+    val worldX: Float,
+    val worldY: Float,
+    val createdAtMs: Long = System.currentTimeMillis()
 )
 
 /** Stable on-disk brush codes. Never renumber existing codes (1=PEN, 2=PENCIL, 3=HIGHLIGHTER, 4=BALLPOINT, 5=DASHED, 6=TAPE). */
@@ -273,5 +304,7 @@ data class PenTelemetry(
     val fingerContacts: Int = 0,
     val cancellations: Int = 0,
     val zoomPercent: Int = 100,
+    val currentPage: Int = 1,
+    val totalPages: Int = 1,
     val lastShapeDetected: String? = null
 )

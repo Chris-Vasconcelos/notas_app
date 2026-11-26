@@ -29,6 +29,10 @@ android {
         compose = true
     }
 
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -52,4 +56,5 @@ dependencies {
     implementation("androidx.ink:ink-rendering:$inkVersion")
     implementation("androidx.ink:ink-strokes:$inkVersion")
     implementation("androidx.input:input-motionprediction:1.0.0")
+    testImplementation("junit:junit:4.13.2")
 }

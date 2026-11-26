@@ -120,7 +120,9 @@ class MainActivity : ComponentActivity() {
     private var laserColorArgb by mutableIntStateOf(0xFFFF1744.toInt())
     private var laserFadeDurationMs by mutableLongStateOf(1500L)
 
-    // Paper & live template controls (Section 05 & 22)
+    // Paper, layout mode & live template controls (Section 01, 03, 05 & 22)
+    private var layoutMode by mutableStateOf(CanvasLayoutMode.PAGED)
+    private var autoAddPage by mutableStateOf(true)
     private var paperStyle by mutableStateOf(PaperStyle.LIGHT)
     private var paperTemplate by mutableStateOf(PaperTemplate.GRID)
     private var templateSpacingDp by mutableFloatStateOf(22f)
@@ -129,6 +131,8 @@ class MainActivity : ComponentActivity() {
     // Notein-inspired advanced settings & guides
     private var rulerEnabled by mutableStateOf(false)
     private var minimapOpen by mutableStateOf(false)
+    private var rightSidebarOpen by mutableStateOf(false)
+    private var gridViewOpen by mutableStateOf(false)
     private var fixedToolbarMode by mutableStateOf(false)
     private var readingMode by mutableStateOf(false)
     private var revealAllTapes by mutableStateOf(false)
@@ -139,9 +143,18 @@ class MainActivity : ComponentActivity() {
     private var pressureEraserEnabled by mutableStateOf(false)
     private var pressureEraserThreshold by mutableFloatStateOf(0.78f)
 
-    // Layers state synchronization (Section 19 · 图层)
+    // Layers, Outline & Comments state (Section 17 & 19)
     private var activeLayerName by mutableStateOf("Capa 1")
     private var layersRevision by mutableIntStateOf(0)
+    private val outlines = mutableStateListOf<OutlineEntry>()
+    private val comments = mutableStateListOf<CommentEntry>()
+    private var showAddOutlineDialog by mutableStateOf(false)
+    private var showAddCommentDialog by mutableStateOf(false)
+
+    // Debounced background auto-save
+    private val saveExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val saveHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val debouncedSaveRunnable = Runnable { performPersistToDisk() }
 
     // Favorite presets in the movable pencil box
     private val favoritePresets = mutableStateListOf(
@@ -202,6 +215,9 @@ class MainActivity : ComponentActivity() {
                     TopEditorBar(
                         title = appTitle,
                         zoomPercent = telemetry.zoomPercent,
+                        currentPage = telemetry.currentPage,
+                        totalPages = telemetry.totalPages,
+                        layoutMode = layoutMode,
                         activeLayerName = activeLayerName,
                         rulerEnabled = rulerEnabled,
                         onToggleRuler = {
@@ -211,6 +227,18 @@ class MainActivity : ComponentActivity() {
                         minimapOpen = minimapOpen,
                         onToggleMinimap = {
                             minimapOpen = !minimapOpen
+                            minimapTrigger++
+                        },
+                        gridViewOpen = gridViewOpen,
+                        onToggleGridView = {
+                            gridViewOpen = !gridViewOpen
+                            if (gridViewOpen) rightSidebarOpen = false
+                            minimapTrigger++
+                        },
+                        rightSidebarOpen = rightSidebarOpen,
+                        onToggleRightSidebar = {
+                            rightSidebarOpen = !rightSidebarOpen
+                            if (rightSidebarOpen) gridViewOpen = false
                             minimapTrigger++
                         },
                         onOpenLayers = {
@@ -297,10 +325,14 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onRequestTextBoxEditor = { existing, wx, wy ->
                                         pendingTextBoxEdit = PendingTextBoxEdit(existing, wx, wy)
+                                    },
+                                    onContentMutated = {
+                                        scheduleAutoSave()
                                     }
                                 ).also { view ->
                                     sheet = view
                                     syncSheetConfig(view)
+                                    loadPersistedNotebook(view)
                                     refreshActiveLayerName()
                                 }
                             },
@@ -557,7 +589,213 @@ class MainActivity : ComponentActivity() {
                                 onApplyFavorite = { preset -> applyFavoritePreset(preset) }
                             )
                         }
+
+                        // Right Sidebar Drawer (Section 17 · 右侧边栏: Páginas, Esquema, Notas)
+                        if (rightSidebarOpen) {
+                            val currentSheet = sheet
+                            RightOverviewSidebar(
+                                currentPageIndex = (telemetry.currentPage - 1).coerceAtLeast(0),
+                                pageCount = telemetry.totalPages.coerceAtLeast(1),
+                                layoutMode = layoutMode,
+                                isDarkPaper = paperStyle.isDark,
+                                outlines = outlines,
+                                comments = comments,
+                                pageSnapshotProvider = { idx ->
+                                    currentSheet?.snapshotPageMiniItems(idx)
+                                        ?: (RectF(0f, 0f, 1000f, 1400f) to emptyList())
+                                },
+                                onJumpToPage = { idx ->
+                                    currentSheet?.jumpToPage(idx)
+                                    minimapTrigger++
+                                },
+                                onInsertPageAfter = { idx ->
+                                    currentSheet?.insertPageAfter(idx)
+                                    minimapTrigger++
+                                    scheduleAutoSave()
+                                },
+                                onDuplicatePage = { idx ->
+                                    currentSheet?.duplicatePage(idx)
+                                    minimapTrigger++
+                                    scheduleAutoSave()
+                                },
+                                onDeletePage = { idx ->
+                                    currentSheet?.deletePage(idx)
+                                    minimapTrigger++
+                                    scheduleAutoSave()
+                                },
+                                onAddOutlineForCurrentPage = { showAddOutlineDialog = true },
+                                onJumpToOutline = { entry ->
+                                    if (layoutMode == CanvasLayoutMode.PAGED) {
+                                        currentSheet?.jumpToPage(entry.pageIndex)
+                                    } else {
+                                        currentSheet?.jumpCameraToWorldCenter(entry.worldX, entry.worldY)
+                                    }
+                                    minimapTrigger++
+                                },
+                                onIndentOutline = { entry, delta ->
+                                    val i = outlines.indexOfFirst { it.id == entry.id }
+                                    if (i >= 0) {
+                                        outlines[i] = outlines[i].copy(
+                                            indentLevel = (outlines[i].indentLevel + delta).coerceIn(0, 5)
+                                        )
+                                        scheduleAutoSave()
+                                    }
+                                },
+                                onDeleteOutline = { entry ->
+                                    outlines.removeAll { it.id == entry.id }
+                                    scheduleAutoSave()
+                                },
+                                onAddCommentForCurrentPage = { showAddCommentDialog = true },
+                                onJumpToComment = { c ->
+                                    if (layoutMode == CanvasLayoutMode.PAGED) {
+                                        currentSheet?.jumpToPage(c.pageIndex)
+                                    } else {
+                                        currentSheet?.jumpCameraToWorldCenter(c.worldX, c.worldY)
+                                    }
+                                    minimapTrigger++
+                                },
+                                onDeleteComment = { c ->
+                                    comments.removeAll { it.id == c.id }
+                                    scheduleAutoSave()
+                                },
+                                onOpenGridView = {
+                                    rightSidebarOpen = false
+                                    gridViewOpen = true
+                                },
+                                onClose = { rightSidebarOpen = false },
+                                modifier = Modifier.align(Alignment.TopEnd)
+                            )
+                        }
+
+                        // Full-screen Bird's-Eye Page Grid Modal (Sections 18 & 23 · 平铺缩略图)
+                        if (gridViewOpen) {
+                            val currentSheet = sheet
+                            PageGridModal(
+                                currentPageIndex = (telemetry.currentPage - 1).coerceAtLeast(0),
+                                pageCount = telemetry.totalPages.coerceAtLeast(1),
+                                isDarkPaper = paperStyle.isDark,
+                                pageSnapshotProvider = { idx ->
+                                    currentSheet?.snapshotPageMiniItems(idx)
+                                        ?: (RectF(0f, 0f, 1000f, 1400f) to emptyList())
+                                },
+                                onJumpToPage = { idx ->
+                                    currentSheet?.jumpToPage(idx)
+                                    minimapTrigger++
+                                },
+                                onInsertPageAfter = { idx ->
+                                    currentSheet?.insertPageAfter(idx)
+                                    minimapTrigger++
+                                    scheduleAutoSave()
+                                },
+                                onDuplicatePage = { idx ->
+                                    currentSheet?.duplicatePage(idx)
+                                    minimapTrigger++
+                                    scheduleAutoSave()
+                                },
+                                onDeletePage = { idx ->
+                                    currentSheet?.deletePage(idx)
+                                    minimapTrigger++
+                                    scheduleAutoSave()
+                                },
+                                onClose = { gridViewOpen = false }
+                            )
+                        }
                     }
+                }
+
+                // Add Outline Bookmark Dialog (Section 17 · 大纲)
+                if (showAddOutlineDialog) {
+                    var titleText by remember { mutableStateOf("") }
+                    AlertDialog(
+                        onDismissRequest = { showAddOutlineDialog = false },
+                        containerColor = GraphiteSurface,
+                        title = { Text("Nuevo marcador en Esquema (Pág ${telemetry.currentPage})") },
+                        text = {
+                            OutlinedTextField(
+                                value = titleText,
+                                onValueChange = { titleText = it },
+                                label = { Text("Título del tema o capítulo") },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showAddOutlineDialog = false }) { Text("Cancelar") }
+                        },
+                        confirmButton = {
+                            TextButton(
+                                onClick = {
+                                    val t = titleText.trim()
+                                    if (t.isNotEmpty()) {
+                                        val s = sheet
+                                        val pIdx = (telemetry.currentPage - 1).coerceAtLeast(0)
+                                        val wx = if (s != null) (s.width * 0.5f - s.panX) / s.viewScale else 0f
+                                        val wy = if (s != null) (s.height * 0.5f - s.panY) / s.viewScale else 0f
+                                        outlines.add(
+                                            OutlineEntry(
+                                                id = System.currentTimeMillis(),
+                                                title = t,
+                                                pageIndex = pIdx,
+                                                worldX = wx,
+                                                worldY = wy,
+                                                indentLevel = 0
+                                            )
+                                        )
+                                        scheduleAutoSave()
+                                    }
+                                    showAddOutlineDialog = false
+                                }
+                            ) {
+                                Text("Agregar", color = Petroleum)
+                            }
+                        }
+                    )
+                }
+
+                // Add Comment Dialog (Section 17 · 备注)
+                if (showAddCommentDialog) {
+                    var commentText by remember { mutableStateOf("") }
+                    AlertDialog(
+                        onDismissRequest = { showAddCommentDialog = false },
+                        containerColor = GraphiteSurface,
+                        title = { Text("Nueva nota en Pág ${telemetry.currentPage}") },
+                        text = {
+                            OutlinedTextField(
+                                value = commentText,
+                                onValueChange = { commentText = it },
+                                label = { Text("Comentario o recordatorio") },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showAddCommentDialog = false }) { Text("Cancelar") }
+                        },
+                        confirmButton = {
+                            TextButton(
+                                onClick = {
+                                    val t = commentText.trim()
+                                    if (t.isNotEmpty()) {
+                                        val s = sheet
+                                        val pIdx = (telemetry.currentPage - 1).coerceAtLeast(0)
+                                        val wx = if (s != null) (s.width * 0.5f - s.panX) / s.viewScale else 0f
+                                        val wy = if (s != null) (s.height * 0.5f - s.panY) / s.viewScale else 0f
+                                        comments.add(
+                                            CommentEntry(
+                                                id = System.currentTimeMillis(),
+                                                text = t,
+                                                pageIndex = pIdx,
+                                                worldX = wx,
+                                                worldY = wy
+                                            )
+                                        )
+                                        scheduleAutoSave()
+                                    }
+                                    showAddCommentDialog = false
+                                }
+                            ) {
+                                Text("Guardar", color = Petroleum)
+                            }
+                        }
+                    )
                 }
 
                 // Rich Text Box Editor Dialog (Section 13 · 文本框)
@@ -649,10 +887,22 @@ class MainActivity : ComponentActivity() {
 
                 if (showPaperDialog) {
                     PaperSettingsDialog(
+                        layoutMode = layoutMode,
+                        autoAddPage = autoAddPage,
                         currentStyle = paperStyle,
                         currentTemplate = paperTemplate,
                         templateSpacingDp = templateSpacingDp,
                         templateOpacity = templateOpacity,
+                        onSelectLayoutMode = { mode ->
+                            layoutMode = mode
+                            sheet?.layoutMode = mode
+                            scheduleAutoSave()
+                        },
+                        onChangeAutoAddPage = { enabled ->
+                            autoAddPage = enabled
+                            sheet?.autoAddPage = enabled
+                            scheduleAutoSave()
+                        },
                         onSelectStyle = { style ->
                             paperStyle = style
                             sheet?.paperStyle = style
@@ -664,24 +914,29 @@ class MainActivity : ComponentActivity() {
                                 selectedPenColorIdx = 1
                                 sheet?.inkColor = palette[selectedPenColorIdx].argb
                             }
+                            scheduleAutoSave()
                         },
                         onSelectTemplate = { template ->
                             paperTemplate = template
                             sheet?.paperTemplate = template
+                            scheduleAutoSave()
                         },
                         onChangeSpacing = { spacing ->
                             templateSpacingDp = spacing
                             sheet?.templateSpacingDp = spacing
+                            scheduleAutoSave()
                         },
                         onChangeOpacity = { op ->
                             templateOpacity = op
                             sheet?.templateOpacity = op
+                            scheduleAutoSave()
                         },
                         onResetDefaults = {
                             templateSpacingDp = 22f
                             templateOpacity = 1.0f
                             sheet?.templateSpacingDp = 22f
                             sheet?.templateOpacity = 1.0f
+                            scheduleAutoSave()
                         },
                         onDismiss = { showPaperDialog = false }
                     )
@@ -907,12 +1162,77 @@ class MainActivity : ComponentActivity() {
         view.allowFingerDrawing = allowFingerDrawing
         view.pressureEraserEnabled = pressureEraserEnabled
         view.pressureEraserThreshold = pressureEraserThreshold
+        view.layoutMode = layoutMode
+        view.autoAddPage = autoAddPage
         view.paperStyle = paperStyle
         view.paperTemplate = paperTemplate
         view.templateSpacingDp = templateSpacingDp
         view.templateOpacity = templateOpacity
         view.showDiagnostics = showHudOverlay
         view.debugCompareNormalized = debugCompareNormalized
+    }
+
+    override fun onPause() {
+        super.onPause()
+        saveHandler.removeCallbacks(debouncedSaveRunnable)
+        performPersistToDisk()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        saveHandler.removeCallbacks(debouncedSaveRunnable)
+        saveExecutor.shutdown()
+    }
+
+    private fun scheduleAutoSave() {
+        saveHandler.removeCallbacks(debouncedSaveRunnable)
+        saveHandler.postDelayed(debouncedSaveRunnable, 750L)
+    }
+
+    private fun performPersistToDisk() {
+        val currentSheet = sheet ?: return
+        val records = currentSheet.exportPersistedItems()
+        val meta = NoteMetadata(
+            uuid = "default-notebook",
+            title = "Cuaderno S Pen Lab",
+            layoutMode = layoutMode,
+            pageCount = currentSheet.pageCount,
+            autoAddPage = autoAddPage,
+            paperStyle = paperStyle,
+            paperTemplate = paperTemplate,
+            templateSpacingDp = templateSpacingDp,
+            templateOpacity = templateOpacity,
+            viewScale = currentSheet.viewScale,
+            panX = currentSheet.panX,
+            panY = currentSheet.panY,
+            activeLayerId = currentSheet.activeLayerId,
+            layers = currentSheet.layers.toList(),
+            outlines = outlines.toList(),
+            comments = comments.toList(),
+            updatedAtMs = System.currentTimeMillis()
+        )
+        val dir = filesDir
+        saveExecutor.execute {
+            NoteRepository.saveAtomically(dir, meta, records)
+        }
+    }
+
+    private fun loadPersistedNotebook(view: PenSheet) {
+        val loaded = NoteRepository.load(filesDir, "default-notebook") ?: return
+        val (meta, records) = loaded
+        layoutMode = meta.layoutMode
+        autoAddPage = meta.autoAddPage
+        paperStyle = meta.paperStyle
+        paperTemplate = meta.paperTemplate
+        templateSpacingDp = meta.templateSpacingDp
+        templateOpacity = meta.templateOpacity
+        outlines.clear()
+        outlines.addAll(meta.outlines)
+        comments.clear()
+        comments.addAll(meta.comments)
+        view.importPersistedSession(meta, records)
+        refreshActiveLayerName()
+        minimapTrigger++
     }
 
     private fun currentIndicatorColor(): Color = when (activeTool) {
@@ -1769,10 +2089,14 @@ private fun ToolAndGestureSettingsDialog(
 
 @Composable
 private fun PaperSettingsDialog(
+    layoutMode: CanvasLayoutMode,
+    autoAddPage: Boolean,
     currentStyle: PaperStyle,
     currentTemplate: PaperTemplate,
     templateSpacingDp: Float,
     templateOpacity: Float,
+    onSelectLayoutMode: (CanvasLayoutMode) -> Unit,
+    onChangeAutoAddPage: (Boolean) -> Unit,
     onSelectStyle: (PaperStyle) -> Unit,
     onSelectTemplate: (PaperTemplate) -> Unit,
     onChangeSpacing: (Float) -> Unit,
@@ -1783,12 +2107,43 @@ private fun PaperSettingsDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = GraphiteSurface,
-        title = { Text("Papel, plantilla y cuadrícula") },
+        title = { Text("Tipo de cuaderno, papel y plantilla") },
         text = {
             Column(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier.verticalScroll(rememberScrollState())
             ) {
+                Text("Modo de documento", style = MaterialTheme.typography.labelLarge, color = InkTextSecondary)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    CanvasLayoutMode.entries.forEach { mode ->
+                        val selected = mode == layoutMode
+                        FilterChip(
+                            selected = selected,
+                            onClick = { onSelectLayoutMode(mode) },
+                            label = { Text(mode.label) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = PetroleumDeep,
+                                selectedLabelColor = InkTextPrimary
+                            )
+                        )
+                    }
+                }
+                if (layoutMode == CanvasLayoutMode.PAGED) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "Agregar página automáticamente al escribir abajo",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = InkTextSecondary,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Switch(
+                            checked = autoAddPage,
+                            onCheckedChange = onChangeAutoAddPage,
+                            colors = SwitchDefaults.colors(checkedThumbColor = Petroleum)
+                        )
+                    }
+                }
+                HorizontalDivider(color = GraphiteBorder)
                 Text("Color de hoja", style = MaterialTheme.typography.labelLarge, color = InkTextSecondary)
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),

@@ -52,7 +52,8 @@ class PenSheet(
     context: Context,
     private val onStateChanged: (canUndo: Boolean, canRedo: Boolean, hasSelection: Boolean) -> Unit,
     private val onTelemetryChanged: (PenTelemetry) -> Unit = {},
-    private val onRequestTextBoxEditor: (existing: TextBoxItem?, worldX: Float, worldY: Float) -> Unit = { _, _, _ -> }
+    private val onRequestTextBoxEditor: (existing: TextBoxItem?, worldX: Float, worldY: Float) -> Unit = { _, _, _ -> },
+    private val onContentMutated: () -> Unit = {}
 ) : FrameLayout(context) {
 
     companion object {
@@ -468,6 +469,123 @@ class PenSheet(
             dryInk.invalidate()
         }
 
+    // Paged A4 vs. Infinite Canvas mode (Sections 01, 03 & 17)
+    var layoutMode: CanvasLayoutMode = CanvasLayoutMode.PAGED
+        set(value) {
+            field = value
+            dryInk.invalidate()
+            emitTelemetry()
+        }
+
+    var pageCount: Int = 3
+        set(value) {
+            field = value.coerceIn(1, 500)
+            dryInk.invalidate()
+            emitTelemetry()
+        }
+
+    var autoAddPage: Boolean = true
+
+    val pageHeightWorld: Float
+        get() = max(height.toFloat(), 1100f * density)
+
+    val pageGapWorld: Float
+        get() = 28f * density
+
+    val pageStrideWorld: Float
+        get() = pageHeightWorld + pageGapWorld
+
+    fun currentPageIndex(): Int {
+        if (layoutMode == CanvasLayoutMode.INFINITE) return 0
+        val centerWorldY = (height.coerceAtLeast(1) * 0.5f - panY) / viewScale
+        return (centerWorldY / pageStrideWorld).toInt().coerceIn(0, (pageCount - 1).coerceAtLeast(0))
+    }
+
+    fun pageIndexForWorldY(worldY: Float): Int =
+        (worldY / pageStrideWorld).toInt().coerceIn(0, (pageCount - 1).coerceAtLeast(0))
+
+    fun jumpToPage(pageIdx: Int) {
+        val clamped = pageIdx.coerceIn(0, (pageCount - 1).coerceAtLeast(0))
+        panX = 0f
+        panY = -clamped * pageStrideWorld * viewScale
+        dryInk.invalidate()
+        emitTelemetry()
+    }
+
+    fun insertPageAfter(afterPageIdx: Int) {
+        rememberBeforeChange()
+        val insertIdx = (afterPageIdx + 1).coerceIn(0, pageCount)
+        val thresholdY = insertIdx * pageStrideWorld
+        val stride = pageStrideWorld
+        for (i in items.indices) {
+            val item = items[i]
+            if (item.worldBounds.centerY() >= thresholdY) {
+                items[i] = item.translated(0f, stride, newId = item.id)
+            }
+        }
+        pageCount += 1
+        jumpToPage(insertIdx)
+        emitState()
+    }
+
+    fun duplicatePage(pageIdx: Int) {
+        if (pageIdx !in 0 until pageCount) return
+        rememberBeforeChange()
+        val topY = pageIdx * pageStrideWorld
+        val bottomY = topY + pageHeightWorld
+        val stride = pageStrideWorld
+        val thresholdY = (pageIdx + 1) * stride
+        val sourceItems = items.filter { it.worldBounds.centerY() in topY..bottomY }
+        for (i in items.indices) {
+            val item = items[i]
+            if (item.worldBounds.centerY() >= thresholdY) {
+                items[i] = item.translated(0f, stride, newId = item.id)
+            }
+        }
+        for (src in sourceItems) {
+            items.add(src.translated(0f, stride, newId = allocateId()))
+        }
+        pageCount += 1
+        jumpToPage(pageIdx + 1)
+        emitState()
+    }
+
+    fun deletePage(pageIdx: Int): Boolean {
+        if (pageCount <= 1 || pageIdx !in 0 until pageCount) return false
+        rememberBeforeChange()
+        val topY = pageIdx * pageStrideWorld
+        val stride = pageStrideWorld
+        val nextPageTopY = (pageIdx + 1) * stride
+        items.removeAll { it.worldBounds.centerY() >= topY && it.worldBounds.centerY() < nextPageTopY }
+        for (i in items.indices) {
+            val item = items[i]
+            if (item.worldBounds.centerY() >= nextPageTopY) {
+                items[i] = item.translated(0f, -stride, newId = item.id)
+            }
+        }
+        pageCount = (pageCount - 1).coerceAtLeast(1)
+        jumpToPage(pageIdx.coerceAtMost(pageCount - 1))
+        emitState()
+        return true
+    }
+
+    fun snapshotPageMiniItems(pageIdx: Int): Pair<RectF, List<Pair<RectF, Int>>> {
+        val pageTop = pageIdx * pageStrideWorld
+        val pageW = width.coerceAtLeast(1).toFloat()
+        val pageRect = RectF(0f, pageTop, pageW, pageTop + pageHeightWorld)
+        val matching = items.filter {
+            isLayerVisible(it.layerId) && RectF.intersects(pageRect, it.worldBounds)
+        }.map { item ->
+            val col = when (item) {
+                is InkItem -> item.data.color
+                is ShapeItem -> item.color
+                is TextBoxItem -> item.color
+            }
+            item.worldBounds to col
+        }
+        return pageRect to matching
+    }
+
     var showDiagnostics: Boolean = false
         set(value) {
             field = value
@@ -748,12 +866,17 @@ class PenSheet(
     }
 
     private fun drawPaperTemplate(canvas: Canvas) {
-        if (paperTemplate == PaperTemplate.BLANK) return
-
         val worldLeft = -panX / viewScale
         val worldTop = -panY / viewScale
         val worldRight = (width - panX) / viewScale
         val worldBottom = (height - panY) / viewScale
+
+        if (paperTemplate == PaperTemplate.BLANK) {
+            if (layoutMode == CanvasLayoutMode.PAGED) {
+                drawPagedSeparators(canvas, worldLeft, worldRight, worldTop, worldBottom)
+            }
+            return
+        }
 
         paint.style = Paint.Style.STROKE
         val baseColor = paperStyle.lineColor
@@ -840,6 +963,58 @@ class PenSheet(
                 val headerY = 64f * density
                 canvas.drawLine(marginX, worldTop, marginX, worldBottom, paint)
                 canvas.drawLine(worldLeft, headerY, worldRight, headerY, paint)
+            }
+        }
+
+        if (layoutMode == CanvasLayoutMode.PAGED) {
+            drawPagedSeparators(canvas, worldLeft, worldRight, worldTop, worldBottom)
+        }
+    }
+
+    private fun drawPagedSeparators(
+        canvas: Canvas,
+        worldLeft: Float,
+        worldRight: Float,
+        worldTop: Float,
+        worldBottom: Float
+    ) {
+        val pHeight = pageHeightWorld
+        val pGap = pageGapWorld
+        val stride = pHeight + pGap
+        val pageW = width.coerceAtLeast(1).toFloat()
+
+        for (p in 0 until pageCount) {
+            val pageTop = p * stride
+            val pageBottom = pageTop + pHeight
+            val gapBottom = pageBottom + pGap
+
+            // Draw page number pill near top-right of each visible page
+            if (pageBottom >= worldTop && pageTop <= worldBottom) {
+                val badgeW = 36f * density / viewScale
+                val badgeH = 20f * density / viewScale
+                val bx = max(worldRight - badgeW - 8f * density / viewScale, pageW - badgeW - 10f * density)
+                val by = pageTop + 14f * density / viewScale
+                fillPaint.color = if (paperStyle.isDark) Color.argb(180, 44, 51, 63) else Color.argb(185, 210, 220, 235)
+                val pill = RectF(bx, by, bx + badgeW, by + badgeH)
+                canvas.drawRoundRect(pill, 6f / viewScale, 6f / viewScale, fillPaint)
+
+                paint.style = Paint.Style.FILL
+                paint.color = if (paperStyle.isDark) Color.rgb(215, 224, 238) else Color.rgb(45, 62, 88)
+                paint.textSize = 11f * density / viewScale
+                val numStr = "${p + 1}"
+                val tw = paint.measureText(numStr)
+                canvas.drawText(numStr, pill.centerX() - tw * 0.5f, pill.centerY() + 4f * density / viewScale, paint)
+            }
+
+            // Draw inter-page dark separator band
+            if (p < pageCount - 1 && gapBottom >= worldTop && pageBottom <= worldBottom) {
+                fillPaint.color = if (paperStyle.isDark) Color.rgb(12, 14, 18) else Color.rgb(218, 224, 234)
+                canvas.drawRect(worldLeft, pageBottom, worldRight, gapBottom, fillPaint)
+                paint.style = Paint.Style.STROKE
+                paint.strokeWidth = 1.2f * density / viewScale
+                paint.color = if (paperStyle.isDark) Color.rgb(44, 51, 63) else Color.rgb(185, 196, 212)
+                canvas.drawLine(worldLeft, pageBottom, worldRight, pageBottom, paint)
+                canvas.drawLine(worldLeft, gapBottom, worldRight, gapBottom, paint)
             }
         }
     }
@@ -2588,7 +2763,147 @@ class PenSheet(
     }
 
     private fun emitState() {
+        checkAutoAddPageIfNeeded()
         onStateChanged(undoHistory.isNotEmpty(), redoHistory.isNotEmpty(), selectedIds.isNotEmpty())
+        onContentMutated()
+    }
+
+    private fun checkAutoAddPageIfNeeded() {
+        if (layoutMode != CanvasLayoutMode.PAGED || !autoAddPage || items.isEmpty()) return
+        val maxBottom = items.maxOfOrNull { it.worldBounds.bottom } ?: return
+        val lastPageTop = (pageCount - 1) * pageStrideWorld
+        val triggerY = lastPageTop + pageHeightWorld * 0.80f
+        if (maxBottom >= triggerY && pageCount < 500) {
+            pageCount += 1
+        }
+    }
+
+    /** Captures a pure-data snapshot of all canvas items (no native Ink Stroke references) for background saving. */
+    fun exportPersistedItems(): List<PersistedItem> = items.map { item ->
+        when (item) {
+            is InkItem -> PersistedItem.InkRecord(
+                id = item.id,
+                layerId = item.layerId,
+                data = item.data
+            )
+            is ShapeItem -> PersistedItem.ShapeRecord(
+                id = item.id,
+                layerId = item.layerId,
+                shape = item.shape,
+                color = item.color,
+                fillColor = item.fillColor,
+                strokeWidthWorld = item.strokeWidthWorld,
+                isHighlighter = item.isHighlighter
+            )
+            is TextBoxItem -> PersistedItem.TextRecord(
+                id = item.id,
+                layerId = item.layerId,
+                x = item.x,
+                y = item.y,
+                text = item.text,
+                color = item.color,
+                bgColor = item.bgColor,
+                fontSizeWorld = item.fontSizeWorld,
+                isBold = item.isBold,
+                isItalic = item.isItalic,
+                isUnderline = item.isUnderline
+            )
+        }
+    }
+
+    /** Restores canvas items and camera/layer state on the UI thread. */
+    fun importPersistedSession(meta: NoteMetadata, records: List<PersistedItem>) {
+        undoHistory.clear()
+        redoHistory.clear()
+        selectedIds.clear()
+        erasedIds.clear()
+        revealedTapeIds.clear()
+        items.clear()
+
+        layers.clear()
+        layers.addAll(meta.layers.ifEmpty { listOf(NoteLayer(1, "Capa 1")) })
+        activeLayerId = meta.activeLayerId
+        layoutMode = meta.layoutMode
+        pageCount = meta.pageCount
+        autoAddPage = meta.autoAddPage
+        paperStyle = meta.paperStyle
+        paperTemplate = meta.paperTemplate
+        templateSpacingDp = meta.templateSpacingDp
+        templateOpacity = meta.templateOpacity
+        viewScale = meta.viewScale.coerceIn(0.45f, 4.0f)
+        panX = meta.panX
+        panY = meta.panY
+
+        var maxId = 0L
+        for (rec in records) {
+            if (rec.id > maxId) maxId = rec.id
+            when (rec) {
+                is PersistedItem.InkRecord -> {
+                    if (rec.data.points.isNotEmpty()) {
+                        val stroke = buildStrokeFromData(rec.data)
+                        val bounds = computeStrokeWorldBounds(stroke, rec.data)
+                        items.add(
+                            InkItem(
+                                id = rec.id,
+                                layerId = rec.layerId,
+                                data = rec.data,
+                                stroke = stroke,
+                                worldBounds = bounds,
+                                isHighlighter = rec.data.isHighlighter
+                            )
+                        )
+                    }
+                }
+                is PersistedItem.ShapeRecord -> {
+                    items.add(
+                        ShapeItem(
+                            id = rec.id,
+                            layerId = rec.layerId,
+                            shape = rec.shape,
+                            color = rec.color,
+                            fillColor = rec.fillColor,
+                            strokeWidthWorld = rec.strokeWidthWorld,
+                            worldBounds = rec.shape.computeWorldBounds(rec.strokeWidthWorld),
+                            isHighlighter = rec.isHighlighter
+                        )
+                    )
+                }
+                is PersistedItem.TextRecord -> {
+                    textPaint.textSize = rec.fontSizeWorld
+                    val style = when {
+                        rec.isBold && rec.isItalic -> Typeface.BOLD_ITALIC
+                        rec.isBold -> Typeface.BOLD
+                        rec.isItalic -> Typeface.ITALIC
+                        else -> Typeface.NORMAL
+                    }
+                    textPaint.typeface = Typeface.create(Typeface.DEFAULT, style)
+                    val lines = rec.text.split('\n')
+                    val maxW = lines.maxOfOrNull { textPaint.measureText(it) } ?: (40f * density)
+                    val totalH = lines.size * (rec.fontSizeWorld * 1.3f) + 8f
+                    val bounds = RectF(rec.x, rec.y, rec.x + maxW + 14f, rec.y + totalH)
+                    items.add(
+                        TextBoxItem(
+                            id = rec.id,
+                            layerId = rec.layerId,
+                            x = rec.x,
+                            y = rec.y,
+                            text = rec.text,
+                            color = rec.color,
+                            bgColor = rec.bgColor,
+                            fontSizeWorld = rec.fontSizeWorld,
+                            isBold = rec.isBold,
+                            isItalic = rec.isItalic,
+                            isUnderline = rec.isUnderline,
+                            worldBounds = bounds
+                        )
+                    )
+                }
+            }
+        }
+        nextItemId = maxId + 1L
+        dryInk.invalidate()
+        onStateChanged(undoHistory.isNotEmpty(), redoHistory.isNotEmpty(), selectedIds.isNotEmpty())
+        emitTelemetry()
     }
 
     private fun emitTelemetry() {
@@ -2600,6 +2915,8 @@ class PenSheet(
                 fingerContacts = fingerContacts,
                 cancellations = cancellations,
                 zoomPercent = (viewScale * 100).toInt(),
+                currentPage = currentPageIndex() + 1,
+                totalPages = if (layoutMode == CanvasLayoutMode.PAGED) pageCount else 1,
                 lastShapeDetected = lastShapeDetected
             )
         )
